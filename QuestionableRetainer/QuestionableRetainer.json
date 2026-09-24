@@ -1,0 +1,13 @@
+{
+  "Author": "baanderson40",
+  "Name": "Questionable Retainer",
+  "InternalName": "QuestionableRetainer",
+  "Punchline": "Lets retainers work between quests.",
+  "Description": "Pauses active Questionable automation, runs one AutoRetainer Multi Mode pass, returns to the original character, and resumes the quest.",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "retainer",
+    "automation",
+    "utility"
+  ]
+}

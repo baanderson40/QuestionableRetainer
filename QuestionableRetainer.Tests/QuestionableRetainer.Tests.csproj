@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <LangVersion>latest</LangVersion>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <UseAppHost>false</UseAppHost>
+    </PropertyGroup>
+    <ItemGroup>
+        <Compile Include="..\QuestionableRetainer\Automation\HandoffPhase.cs" Link="Automation\HandoffPhase.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\MonitoringStatus.cs" Link="Automation\MonitoringStatus.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\ReadinessEvaluator.cs" Link="Automation\ReadinessEvaluator.cs" />
+    </ItemGroup>
+</Project>
