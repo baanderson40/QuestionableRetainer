@@ -39,6 +39,26 @@ public sealed class MonitoringStatus
 
     public bool LifestreamBusy { get; internal set; }
 
+    public bool? HenchmanAvailable { get; internal set; }
+
+    public bool HenchmanBusy { get; internal set; }
+
+    public bool YesAlreadyLeaseAcquired { get; internal set; }
+
+    public HandoffKind? ActiveHandoffKind { get; internal set; }
+
+    public DateTime? NextOceanWindowUtc { get; internal set; }
+
+    public bool OceanLaunchEligible { get; internal set; }
+
+    public bool OceanWindowHandled { get; internal set; }
+
+    public bool OceanDutyStarted { get; internal set; }
+
+    public bool OceanDutyCompleted { get; internal set; }
+
+    public DateTime? OceanCleanupStableSinceUtc { get; internal set; }
+
     public int RegisteredCharacterCount { get; internal set; }
 
     public int ReadyCharacterCount { get; internal set; }
@@ -73,7 +93,7 @@ public sealed class MonitoringStatus
         MonitoringState.WaitingForReadyWork => "Running, waiting for ready work",
         MonitoringState.ReadyWorkBlocked => "Ready work waiting",
         MonitoringState.ReadyWorkDetected => "Ready work detected",
-        MonitoringState.Processing => "Processing AutoRetainer handoff",
+        MonitoringState.Processing => "Processing handoff",
         MonitoringState.Recovering => "Recovering interrupted handoff",
         MonitoringState.Error => "Error",
         _ => Reason,
@@ -103,6 +123,18 @@ public sealed class AutoRetainerReadinessSnapshot
 
 public static class MonitoringStatusFormatter
 {
+    public static bool IsHeartbeatDue(DateTime now, DateTime lastLogUtc, TimeSpan interval) =>
+        now >= lastLogUtc + interval;
+
+    public static bool ShouldLog(
+        MonitoringState state,
+        bool changed,
+        DateTime now,
+        DateTime lastLogUtc,
+        TimeSpan heartbeatInterval) =>
+        state != MonitoringState.Disabled &&
+        (changed || IsHeartbeatDue(now, lastLogUtc, heartbeatInterval));
+
     public static string Format(MonitoringStatus status)
     {
         var closest = status.ClosestRetainerSeconds is { } seconds
@@ -117,6 +149,12 @@ public static class MonitoringStatusFormatter
                $"AutoRetainer={FormatAvailability(status.AutoRetainerAvailable)}; " +
                $"Busy={status.AutoRetainerBusy}; MultiMode={status.AutoRetainerMultiModeActive}; " +
                $"Lifestream={FormatAvailability(status.LifestreamAvailable)}; " +
+               $"Henchman={FormatAvailability(status.HenchmanAvailable)}; HenchmanBusy={status.HenchmanBusy}; " +
+               $"YesAlreadyLease={status.YesAlreadyLeaseAcquired}; " +
+               $"HandoffKind={(status.ActiveHandoffKind?.ToString() ?? "none")}; " +
+               $"NextOcean={status.NextOceanWindowUtc?.ToString("O") ?? "none"}; OceanEligible={status.OceanLaunchEligible}; OceanHandled={status.OceanWindowHandled}; " +
+               $"OceanDutyStarted={status.OceanDutyStarted}; OceanDutyCompleted={status.OceanDutyCompleted}; " +
+               $"OceanCleanupStableSince={status.OceanCleanupStableSinceUtc?.ToString("O") ?? "none"}; " +
                $"ReadinessScan={FormatAvailability(status.ReadinessScanAvailable)}; " +
                $"Registered={status.RegisteredCharacterCount}; Ready={status.ReadyCharacterCount}; " +
                $"ClosestRetainer={closest}; LastReadinessScanUtc={lastReadinessScan}; " +
@@ -175,6 +213,12 @@ public static class MonitoringStatusFormatter
             HandoffPhase.WaitingForOriginal => "Logging into original character",
             HandoffPhase.ResumingQuestionable => "Restarting Questionable",
             HandoffPhase.WaitingForQuestionableResume => "Confirming Questionable resumed",
+            HandoffPhase.AwaitingManualQuestionableResume => "Awaiting manual Questionable resume",
+            HandoffPhase.WaitingForAutoRetainerIdle => "Preparing AutoRetainer",
+            HandoffPhase.WaitingForHenchmanStart => "Starting Henchman",
+            HandoffPhase.WaitingForOceanDuty => "Waiting for Ocean Fishing voyage",
+            HandoffPhase.WaitingForOceanCleanup => "Waiting for Ocean Fishing cleanup",
+            HandoffPhase.WaitingForHenchmanStop => "Stopping Henchman",
             HandoffPhase.Error => "Error",
             _ => phase.ToString(),
         };

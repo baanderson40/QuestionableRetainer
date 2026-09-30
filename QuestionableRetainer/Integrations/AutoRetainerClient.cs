@@ -141,6 +141,7 @@ public sealed class AutoRetainerClient : IDisposable
         try
         {
             enableSingleMultiMode.InvokeAction(mode);
+            log.Information("AutoRetainer single-pass IPC invoked. Mode={Mode} Accepted=true.", mode);
             return true;
         }
         catch (Exception ex)

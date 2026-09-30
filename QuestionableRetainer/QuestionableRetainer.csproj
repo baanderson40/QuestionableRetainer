@@ -4,7 +4,7 @@
         <TargetFramework>net10.0-windows7.0</TargetFramework>
         <Platforms>x64</Platforms>
         <Version>0.1.0.0</Version>
-        <Description>Pauses Questionable to run ready AutoRetainer work, then returns and resumes questing.</Description>
+        <Description>Pauses Questionable for AutoRetainer work or experimental Ocean Fishing, then returns and resumes questing.</Description>
         <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
         <IsPackable>false</IsPackable>
         <ImplicitUsings>enable</ImplicitUsings>

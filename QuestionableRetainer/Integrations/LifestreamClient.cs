@@ -39,6 +39,10 @@ public sealed class LifestreamClient
         {
             var result = changeCharacter.InvokeFunc(name, world);
             error = result == ErrorCode.Success ? string.Empty : result.ToString();
+            log.Information(
+                "Lifestream return IPC invoked. Target=original-character Result={Result} Accepted={Accepted}.",
+                result,
+                result == ErrorCode.Success);
             return result == ErrorCode.Success;
         }
         catch (Exception ex)
