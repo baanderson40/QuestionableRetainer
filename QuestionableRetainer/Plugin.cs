@@ -90,6 +90,7 @@ public sealed class Plugin : IDalamudPlugin
             Condition,
             ChatGui,
             NotificationManager,
+            Framework,
             Log,
             SaveConfiguration);
         configurationWindow = new ConfigurationWindow(configuration, controller, SaveConfiguration);

@@ -37,6 +37,7 @@ public sealed class HandoffController : IDisposable
     private readonly ICondition condition;
     private readonly IChatGui chatGui;
     private readonly INotificationManager notificationManager;
+    private readonly IFramework framework;
     private readonly IPluginLog log;
     private readonly Action save;
     private readonly MonitoringStatus monitoring = new();
@@ -58,6 +59,7 @@ public sealed class HandoffController : IDisposable
     private bool recoveryPending;
     private bool questionablePausedThisRuntime;
     private bool manualResumeAuthorized;
+    private bool offFrameworkUpdateLogged;
 
     public HandoffController(
         Configuration configuration,
@@ -74,6 +76,7 @@ public sealed class HandoffController : IDisposable
         ICondition condition,
         IChatGui chatGui,
         INotificationManager notificationManager,
+        IFramework framework,
         IPluginLog log,
         Action save)
     {
@@ -91,6 +94,7 @@ public sealed class HandoffController : IDisposable
         this.condition = condition;
         this.chatGui = chatGui;
         this.notificationManager = notificationManager;
+        this.framework = framework;
         this.log = log;
         this.save = save;
         autoRetainer.SingleMultiModeFinished += OnSingleMultiModeFinished;
@@ -138,6 +142,17 @@ public sealed class HandoffController : IDisposable
 
     public void Update()
     {
+        if (!framework.IsInFrameworkUpdateThread)
+        {
+            if (!offFrameworkUpdateLogged)
+            {
+                offFrameworkUpdateLogged = true;
+                log.Warning("Handoff update was invoked outside the Dalamud framework thread; update skipped.");
+            }
+
+            return;
+        }
+
         var now = DateTime.UtcNow;
         if (now < nextUpdateUtc)
             return;
@@ -203,7 +218,9 @@ public sealed class HandoffController : IDisposable
         }
     }
 
-    public void Recover()
+    public void Recover() => DispatchToFrameworkThread(RecoverCore, nameof(Recover));
+
+    private void RecoverCore()
     {
         if (configuration.ActiveSession is null)
         {
@@ -228,7 +245,9 @@ public sealed class HandoffController : IDisposable
         log.Information("Recovery requested. Session={Session} Phase={Phase}.", SessionId(), Phase);
     }
 
-    public void ResumeQuestionable()
+    public void ResumeQuestionable() => DispatchToFrameworkThread(ResumeQuestionableCore, nameof(ResumeQuestionable));
+
+    private void ResumeQuestionableCore()
     {
         if (configuration.ActiveSession is null)
         {
@@ -244,7 +263,9 @@ public sealed class HandoffController : IDisposable
         log.Information("Manual Questionable resume authorized. Session={Session} Phase={Phase}.", SessionId(), Phase);
     }
 
-    public void CancelRecovery()
+    public void CancelRecovery() => DispatchToFrameworkThread(CancelRecoveryCore, nameof(CancelRecovery));
+
+    private void CancelRecoveryCore()
     {
         if (Phase is not (HandoffPhase.Error or HandoffPhase.AwaitingManualQuestionableResume))
         {
@@ -1915,7 +1936,10 @@ public sealed class HandoffController : IDisposable
 
     private bool HasTimedOut(DateTime now, TimeSpan timeout) => now >= phaseStartedUtc + timeout;
 
-    private void OnSingleMultiModeFinished()
+    private void OnSingleMultiModeFinished() =>
+        DispatchToFrameworkThread(HandleSingleMultiModeFinished, "AutoRetainer completion callback");
+
+    private void HandleSingleMultiModeFinished()
     {
         completionEventReceived = true;
         log.Information(
@@ -1926,7 +1950,10 @@ public sealed class HandoffController : IDisposable
             autoRetainerMultiModeObserved);
     }
 
-    private void OnDutyStarted(IDutyStateEventArgs args)
+    private void OnDutyStarted(IDutyStateEventArgs args) =>
+        DispatchToFrameworkThread(HandleDutyStarted, "duty-start callback");
+
+    private void HandleDutyStarted()
     {
         var session = configuration.ActiveSession;
         if (session is null || !IsOceanLeg(session) || !session.HenchmanStartObserved || !IsOceanFishingTerritory())
@@ -1941,7 +1968,10 @@ public sealed class HandoffController : IDisposable
         log.Information("Ocean Fishing duty-start event received. Session={Session}.", SessionId());
     }
 
-    private void OnDutyCompleted(IDutyStateEventArgs args)
+    private void OnDutyCompleted(IDutyStateEventArgs args) =>
+        DispatchToFrameworkThread(HandleDutyCompleted, "duty-completed callback");
+
+    private void HandleDutyCompleted()
     {
         var session = configuration.ActiveSession;
         if (session is null || !IsOceanLeg(session) || !session.OceanDutyStarted || session.OceanDutyCompleted)
@@ -2128,6 +2158,34 @@ public sealed class HandoffController : IDisposable
                 Content = message,
                 Type = type,
             });
+        }
+    }
+
+    private void DispatchToFrameworkThread(Action action, string operation)
+    {
+        if (framework.IsInFrameworkUpdateThread)
+        {
+            action();
+            return;
+        }
+
+        try
+        {
+            _ = framework.RunOnFrameworkThread(() =>
+            {
+                try
+                {
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    log.Error(ex, "Framework-thread operation failed. Operation={Operation}.", operation);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            log.Error(ex, "Could not dispatch operation to the Dalamud framework thread. Operation={Operation}.", operation);
         }
     }
 
