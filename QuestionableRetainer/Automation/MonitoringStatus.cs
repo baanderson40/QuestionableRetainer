@@ -47,6 +47,14 @@ public sealed class MonitoringStatus
 
     public HandoffKind? ActiveHandoffKind { get; internal set; }
 
+    public HandoffLeg? CurrentHandoffLeg { get; internal set; }
+
+    public bool OceanLegResolved { get; internal set; }
+
+    public bool AutoRetainerLegResolved { get; internal set; }
+
+    public AutoRetainerPassMode? PendingAutoRetainerMode { get; internal set; }
+
     public DateTime? NextOceanWindowUtc { get; internal set; }
 
     public bool OceanLaunchEligible { get; internal set; }
@@ -152,6 +160,7 @@ public static class MonitoringStatusFormatter
                $"Henchman={FormatAvailability(status.HenchmanAvailable)}; HenchmanBusy={status.HenchmanBusy}; " +
                $"YesAlreadyLease={status.YesAlreadyLeaseAcquired}; " +
                $"HandoffKind={(status.ActiveHandoffKind?.ToString() ?? "none")}; " +
+               $"HandoffLeg={(status.CurrentHandoffLeg?.ToString() ?? "none")}; OceanLegResolved={status.OceanLegResolved}; AutoRetainerLegResolved={status.AutoRetainerLegResolved}; PendingAutoRetainerMode={(status.PendingAutoRetainerMode?.ToString() ?? "none")}; " +
                $"NextOcean={status.NextOceanWindowUtc?.ToString("O") ?? "none"}; OceanEligible={status.OceanLaunchEligible}; OceanHandled={status.OceanWindowHandled}; " +
                $"OceanDutyStarted={status.OceanDutyStarted}; OceanDutyCompleted={status.OceanDutyCompleted}; " +
                $"OceanCleanupStableSince={status.OceanCleanupStableSinceUtc?.ToString("O") ?? "none"}; " +
@@ -219,6 +228,7 @@ public static class MonitoringStatusFormatter
             HandoffPhase.WaitingForOceanDuty => "Waiting for Ocean Fishing voyage",
             HandoffPhase.WaitingForOceanCleanup => "Waiting for Ocean Fishing cleanup",
             HandoffPhase.WaitingForHenchmanStop => "Stopping Henchman",
+            HandoffPhase.CheckingChainedWork => "Checking chained work",
             HandoffPhase.Error => "Error",
             _ => phase.ToString(),
         };

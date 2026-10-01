@@ -16,6 +16,7 @@ public enum HandoffPhase
     WaitingForOceanDuty,
     WaitingForOceanCleanup,
     WaitingForHenchmanStop,
+    CheckingChainedWork,
 }
 
 public enum HandoffKind
@@ -24,9 +25,23 @@ public enum HandoffKind
     OceanFishing,
 }
 
+public enum HandoffLeg
+{
+    None,
+    AutoRetainer,
+    OceanFishing,
+}
+
+public enum AutoRetainerPassMode
+{
+    Retainers,
+    Deployables,
+    Everything,
+}
+
 public sealed class HandoffSession
 {
-    public int SessionVersion { get; set; } = 3;
+    public int SessionVersion { get; set; } = 4;
 
     public string CorrelationId { get; set; } = string.Empty;
 
@@ -39,6 +54,30 @@ public sealed class HandoffSession
     public string QuestId { get; set; } = string.Empty;
 
     public HandoffKind Kind { get; set; }
+
+    public HandoffLeg CurrentLeg { get; set; }
+
+    public bool AutoRetainerLegCompleted { get; set; }
+
+    public bool AutoRetainerLegSkipped { get; set; }
+
+    public bool OceanFishingLegCompleted { get; set; }
+
+    public bool OceanFishingLegSkipped { get; set; }
+
+    public AutoRetainerPassMode? PendingAutoRetainerMode { get; set; }
+
+    public bool ReturningForAutoRetainer { get; set; }
+
+    public bool ChainedReadinessChecked { get; set; }
+
+    public int? ChainedRegisteredCharacterCount { get; set; }
+
+    public int? ChainedReadyCharacterCount { get; set; }
+
+    public long? ChainedClosestRetainerSeconds { get; set; }
+
+    public DateTime? ChainedReadinessScanUtc { get; set; }
 
     public DateTime? OceanWindowStartUtc { get; set; }
 

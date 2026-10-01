@@ -36,6 +36,10 @@ var tests = new (string Name, Action Test)[]
     ("Ocean Fishing exact close selects next window", TestOceanFishingNextWindow),
     ("Ocean Fishing cleanup requires stable conditions", TestOceanFishingCleanup),
     ("Ocean Fishing cleanup rejects active result state", TestOceanFishingCleanupBlocked),
+    ("chained planner prioritizes eligible Ocean Fishing", TestChainedOceanPriority),
+    ("chained planner selects AutoRetainer after Ocean", TestChainedAutoRetainer),
+    ("chained planner returns when work is resolved", TestChainedReturn),
+    ("chained planner skips Ocean after cutoff", TestChainedOceanCutoff),
 };
 
 foreach (var (name, test) in tests)
@@ -351,6 +355,61 @@ static void TestOceanFishingCleanupBlocked()
         true,
         false,
         false)));
+}
+
+static void TestChainedOceanPriority()
+{
+    AssertEqual(
+        ChainedWorkAction.StartOceanFishing,
+        ChainedWorkPlanner.Choose(new(
+            OceanMonitoringEnabled: true,
+            OceanLegResolved: false,
+            OceanWindowEligible: true,
+            OceanWindowHandled: false,
+            AutoRetainerMonitoringEnabled: true,
+            AutoRetainerLegResolved: false)));
+}
+
+static void TestChainedAutoRetainer()
+{
+    AssertEqual(
+        ChainedWorkAction.ScanAutoRetainer,
+        ChainedWorkPlanner.Choose(new(
+            OceanMonitoringEnabled: true,
+            OceanLegResolved: true,
+            OceanWindowEligible: false,
+            OceanWindowHandled: true,
+            AutoRetainerMonitoringEnabled: true,
+            AutoRetainerLegResolved: false)));
+}
+
+static void TestChainedReturn()
+{
+    AssertEqual(
+        ChainedWorkAction.ReturnAndResume,
+        ChainedWorkPlanner.Choose(new(
+            OceanMonitoringEnabled: true,
+            OceanLegResolved: true,
+            OceanWindowEligible: false,
+            OceanWindowHandled: true,
+            AutoRetainerMonitoringEnabled: true,
+            AutoRetainerLegResolved: true)));
+}
+
+static void TestChainedOceanCutoff()
+{
+    var state = OceanFishingSchedule.GetState(
+        new DateTime(2026, 9, 30, 12, 14, 0, DateTimeKind.Utc),
+        TimeSpan.Zero);
+    AssertEqual(
+        ChainedWorkAction.ScanAutoRetainer,
+        ChainedWorkPlanner.Choose(new(
+            OceanMonitoringEnabled: true,
+            OceanLegResolved: false,
+            OceanWindowEligible: state.LaunchEligible,
+            OceanWindowHandled: false,
+            AutoRetainerMonitoringEnabled: true,
+            AutoRetainerLegResolved: false)));
 }
 
 static void AssertTrue(bool value)

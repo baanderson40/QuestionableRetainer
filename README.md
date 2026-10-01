@@ -1,6 +1,6 @@
 # Questionable Retainer
 
-Questionable Retainer pauses active Questionable automation for ready AutoRetainer work or experimental Ocean Fishing handoffs, returns to the original character, and resumes the saved quest.
+Questionable Retainer pauses active Questionable automation for ready AutoRetainer work or experimental Ocean Fishing handoffs, chains eligible AutoRetainer and Ocean Fishing work without restarting Questionable between legs, then returns to the original character and resumes the saved quest.
 
 ## Requirements
 
@@ -8,6 +8,8 @@ Questionable Retainer pauses active Questionable automation for ready AutoRetain
 - Questionable running in Automatic mode
 - Lifestream configured for every registered character and service account
 - Optional Ocean Fishing: Henchman, AutoHook, and vnavmesh
+
+When both monitors are enabled, a completed AutoRetainer pass starts an eligible Ocean Fishing window directly, and a completed Ocean Fishing voyage checks for a fresh AutoRetainer pass before returning. Each handoff runs at most one pass and one voyage. If the optional next leg is unavailable, QR skips it and resumes Questionable. Ocean Fishing is skipped after its minute-13 launch cutoff.
 
 ## Usage
 

@@ -45,6 +45,7 @@ public sealed class ConfigurationWindow : Window
         ImGui.TextUnformatted($"Status: {controller.Monitoring.DisplayState}");
         ImGui.TextWrapped($"Reason: {controller.Monitoring.Reason}");
         ImGui.TextUnformatted($"Handoff: {MonitoringStatusFormatter.FormatPhase(controller.Phase)}");
+        ImGui.TextUnformatted($"Current leg: {controller.Monitoring.CurrentHandoffLeg?.ToString() ?? "none"}");
         if (controller.Monitoring.TriggerReadyCharacterCount is { } triggerReady)
         {
             ImGui.TextUnformatted($"Trigger scan: {triggerReady} / {controller.Monitoring.TriggerRegisteredCharacterCount} characters ready");
@@ -71,7 +72,10 @@ public sealed class ConfigurationWindow : Window
                               $"Handled: {controller.Monitoring.OceanWindowHandled}");
         ImGui.TextUnformatted($"Ocean duty: started={controller.Monitoring.OceanDutyStarted} " +
                               $"completed={controller.Monitoring.OceanDutyCompleted} " +
-                              $"stable since={FormatTimestamp(controller.Monitoring.OceanCleanupStableSinceUtc)}");
+                               $"stable since={FormatTimestamp(controller.Monitoring.OceanCleanupStableSinceUtc)}");
+        ImGui.TextUnformatted($"Chained legs: Ocean resolved={controller.Monitoring.OceanLegResolved} " +
+                              $"AutoRetainer resolved={controller.Monitoring.AutoRetainerLegResolved} " +
+                              $"pending AutoRetainer={controller.Monitoring.PendingAutoRetainerMode?.ToString() ?? "none"}");
         ImGui.TextUnformatted($"Readiness scan: {FormatAvailability(controller.Monitoring.ReadinessScanAvailable)}");
         ImGui.TextUnformatted($"Player blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(controller.Monitoring.PlayerBlockers)}");
         if (controller.Monitoring.TriggerReadyCharacterCount is null)

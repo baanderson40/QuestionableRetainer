@@ -9,6 +9,7 @@
     </PropertyGroup>
     <ItemGroup>
         <Compile Include="..\QuestionableRetainer\Automation\HandoffPhase.cs" Link="Automation\HandoffPhase.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\ChainedWorkPlanner.cs" Link="Automation\ChainedWorkPlanner.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\OceanFishingSchedule.cs" Link="Automation\OceanFishingSchedule.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\OceanFishingCleanupPolicy.cs" Link="Automation\OceanFishingCleanupPolicy.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\QuestionableStopPolicy.cs" Link="Automation\QuestionableStopPolicy.cs" />

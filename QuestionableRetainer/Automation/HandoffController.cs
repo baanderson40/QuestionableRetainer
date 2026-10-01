@@ -100,6 +100,11 @@ public sealed class HandoffController : IDisposable
         Phase = configuration.ActiveSession?.Phase ?? HandoffPhase.Idle;
         phaseStartedUtc = DateTime.UtcNow;
         recoveryPending = configuration.ActiveSession is not null;
+        if (configuration.ActiveSession is { } persistedSession)
+        {
+            NormalizeSession(persistedSession);
+            Phase = persistedSession.Phase;
+        }
         if (configuration.ActiveSession is { } existingSession && string.IsNullOrWhiteSpace(existingSession.CorrelationId))
         {
             existingSession.CorrelationId = CreateCorrelationId();
@@ -167,6 +172,9 @@ public sealed class HandoffController : IDisposable
                 break;
             case HandoffPhase.WaitingForHenchmanStop:
                 UpdateWaitingForHenchmanStop(now);
+                break;
+            case HandoffPhase.CheckingChainedWork:
+                UpdateCheckingChainedWork(now);
                 break;
             case HandoffPhase.WaitingForAutoRetainerIdle:
                 UpdateWaitingForAutoRetainerIdle(now);
@@ -247,7 +255,7 @@ public sealed class HandoffController : IDisposable
         if (configuration.ActiveSession is not { } session ||
             !TryGetAutoRetainerState(out var busy, out var multiModeActive) || busy || multiModeActive ||
             !TryGetLifestreamBusy(out var lifestreamBusy) || lifestreamBusy ||
-            (session.Kind == HandoffKind.OceanFishing && (!henchman.TryGetState(out var henchmanBusy) || henchmanBusy)) ||
+            (IsOceanLeg(session) && (!henchman.TryGetState(out var henchmanBusy) || henchmanBusy)) ||
             !clientState.IsLoggedIn || playerState.ContentId != session.OriginalContentId ||
             CapturePlayerBlockers().Count > 0)
         {
@@ -260,9 +268,9 @@ public sealed class HandoffController : IDisposable
         }
 
         log.Information("Recovery discarded. Session={Session} Phase={Phase}.", SessionId(), Phase);
-        if (session.Kind == HandoffKind.OceanFishing)
+        if (IsOceanLeg(session))
             ReleaseYesAlreadyLease(session);
-        if (session.Kind == HandoffKind.OceanFishing && session.OceanWindowStartUtc is { } windowStart)
+        if (IsOceanLeg(session) && session.OceanWindowStartUtc is { } windowStart)
             configuration.LastHandledOceanFishingWindowUtc = windowStart;
         configuration.ActiveSession = null;
         ReadyCharacterCount = 0;
@@ -446,8 +454,10 @@ public sealed class HandoffController : IDisposable
 
         var session = new HandoffSession
         {
-            SessionVersion = 3,
+            SessionVersion = 4,
             Kind = HandoffKind.AutoRetainer,
+            CurrentLeg = HandoffLeg.AutoRetainer,
+            PendingAutoRetainerMode = GetConfiguredAutoRetainerMode(),
             CorrelationId = CreateCorrelationId(),
             OriginalContentId = original.CID,
             OriginalName = original.Name,
@@ -524,8 +534,9 @@ public sealed class HandoffController : IDisposable
 
         var session = new HandoffSession
         {
-            SessionVersion = 3,
+            SessionVersion = 4,
             Kind = HandoffKind.OceanFishing,
+            CurrentLeg = HandoffLeg.OceanFishing,
             CorrelationId = CreateCorrelationId(),
             OriginalContentId = contentId,
             OriginalName = localPlayer.Name.ToString(),
@@ -620,7 +631,7 @@ public sealed class HandoffController : IDisposable
 
         manualResumeAuthorized = session.Kind == HandoffKind.AutoRetainer;
         session.QuestionableStopConfirmed = true;
-        if (session.Kind == HandoffKind.OceanFishing)
+        if (IsOceanLeg(session))
         {
             save();
             StartHenchman(session);
@@ -677,6 +688,242 @@ public sealed class HandoffController : IDisposable
         SetPhase(HandoffPhase.WaitingForHenchmanStart);
     }
 
+    private void UpdateCheckingChainedWork(DateTime now)
+    {
+        var session = configuration.ActiveSession;
+        if (session is null)
+        {
+            Fail("Recovery data is missing while checking chained work.");
+            return;
+        }
+
+        var oceanState = OceanFishingSchedule.GetState(
+            now,
+            TimeSpan.FromMinutes(Math.Clamp(configuration.OceanFishingLeadMinutes, 0, 30)));
+        var action = ChainedWorkPlanner.Choose(new(
+            configuration.MonitorOceanFishing,
+            session.OceanFishingLegCompleted || session.OceanFishingLegSkipped,
+            oceanState.LaunchEligible,
+            OceanFishingSchedule.IsWindowHandled(configuration.LastHandledOceanFishingWindowUtc, oceanState.Window.StartUtc),
+            configuration.MonitorRetainers || configuration.MonitorDeployables,
+            session.AutoRetainerLegCompleted || session.AutoRetainerLegSkipped));
+
+        if (!session.OceanFishingLegCompleted &&
+            !session.OceanFishingLegSkipped &&
+            now >= oceanState.Window.LaunchCutoffUtc &&
+            !oceanState.LaunchEligible)
+        {
+            session.OceanFishingLegSkipped = true;
+            save();
+            log.Information("Ocean Fishing leg skipped after launch cutoff. Session={Session} WindowStartUtc={WindowStartUtc}.", SessionId(), oceanState.Window.StartUtc);
+        }
+
+        switch (action)
+        {
+            case ChainedWorkAction.StartOceanFishing:
+                if (!TryStartChainedOceanFishing(session, now, oceanState))
+                    return;
+                return;
+            case ChainedWorkAction.ScanAutoRetainer:
+                CheckChainedAutoRetainer(session, now);
+                return;
+            default:
+                SetPhase(HandoffPhase.ReturningOriginal, reason: "All chained work is resolved; returning to the original character.");
+                return;
+        }
+    }
+
+    private void CheckChainedAutoRetainer(HandoffSession session, DateTime now)
+    {
+        if (session.ChainedReadinessChecked)
+        {
+            if (session.ChainedReadyCharacterCount is not > 0)
+            {
+                session.AutoRetainerLegSkipped = true;
+                save();
+                SetPhase(HandoffPhase.ReturningOriginal, reason: "No AutoRetainer work is ready after the completed leg.");
+                return;
+            }
+
+            StartChainedAutoRetainer(session, now);
+            return;
+        }
+
+        if (now < session.ChainedReadinessScanUtc.GetValueOrDefault() + TimeSpan.FromSeconds(5))
+        {
+            Wait(now, "Waiting before refreshing AutoRetainer readiness after the completed leg.");
+            return;
+        }
+
+        if (monitoring.AutoRetainerAvailable != true)
+        {
+            if (HasTimedOut(now, TimeSpan.FromMinutes(1)))
+            {
+                session.AutoRetainerLegSkipped = true;
+                save();
+                SetPhase(HandoffPhase.ReturningOriginal, reason: "AutoRetainer state IPC remained unavailable; skipping optional chained work.");
+            }
+            else
+                Wait(now, "Waiting for AutoRetainer state IPC before checking chained work.");
+            return;
+        }
+
+        var scanned = autoRetainer.TryScanReadiness(
+            configuration.MonitorRetainers,
+            configuration.MonitorDeployables,
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            out var readiness);
+        if (!scanned)
+        {
+            session.ChainedReadinessScanUtc = now;
+            save();
+            if (HasTimedOut(now, TimeSpan.FromMinutes(1)))
+            {
+                session.AutoRetainerLegSkipped = true;
+                save();
+                SetPhase(HandoffPhase.ReturningOriginal, reason: "AutoRetainer readiness remained unavailable; skipping optional chained work.");
+            }
+            else
+                Wait(now, "Waiting for a fresh AutoRetainer readiness scan.");
+            return;
+        }
+
+        session.ChainedReadinessChecked = true;
+        session.ChainedRegisteredCharacterCount = readiness.RegisteredCharacterCount;
+        session.ChainedReadyCharacterCount = readiness.ReadyCharacterCount;
+        session.ChainedClosestRetainerSeconds = readiness.ClosestRetainerSeconds;
+        session.ChainedReadinessScanUtc = now;
+        monitoring.RegisteredCharacterCount = readiness.RegisteredCharacterCount;
+        monitoring.ReadyCharacterCount = readiness.ReadyCharacterCount;
+        monitoring.ClosestRetainerSeconds = readiness.ClosestRetainerSeconds;
+        monitoring.LastReadinessScanUtc = now;
+        ReadyCharacterCount = readiness.ReadyCharacterCount;
+        save();
+
+        if (readiness.ReadyCharacterCount == 0)
+        {
+            session.AutoRetainerLegSkipped = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "No AutoRetainer work is ready after the completed leg.");
+            return;
+        }
+
+        StartChainedAutoRetainer(session, now);
+    }
+
+    private void StartChainedAutoRetainer(HandoffSession session, DateTime now)
+    {
+        session.PendingAutoRetainerMode ??= GetConfiguredAutoRetainerMode();
+        if (session.PendingAutoRetainerMode is null)
+        {
+            session.AutoRetainerLegSkipped = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "AutoRetainer monitoring is disabled; skipping optional chained work.");
+            return;
+        }
+
+        if (!clientState.IsLoggedIn || playerState.ContentId == 0)
+        {
+            Wait(now, "Waiting for the current character before starting chained AutoRetainer work.");
+            return;
+        }
+
+        if (autoRetainer.TryGetCharacter(playerState.ContentId, out _))
+        {
+            session.CurrentLeg = HandoffLeg.AutoRetainer;
+            session.ReturningForAutoRetainer = false;
+            completionEventReceived = false;
+            autoRetainerMultiModeObserved = false;
+            session.AutoRetainerStartRequested = false;
+            session.AutoRetainerMultiModeObserved = false;
+            session.AutoRetainerCompletionReceived = false;
+            save();
+            log.Information("Starting chained AutoRetainer pass from current character. Session={Session}.", SessionId());
+            SetPhase(HandoffPhase.WaitingForAutoRetainerIdle, reason: "Starting chained AutoRetainer work without resuming Questionable.");
+            return;
+        }
+
+        if (playerState.ContentId == session.OriginalContentId && autoRetainer.TryGetCharacter(session.OriginalContentId, out _))
+        {
+            session.CurrentLeg = HandoffLeg.AutoRetainer;
+            session.ReturningForAutoRetainer = false;
+            save();
+            SetPhase(HandoffPhase.WaitingForAutoRetainerIdle, reason: "Original character is already registered for chained AutoRetainer work.");
+            return;
+        }
+
+        if (autoRetainer.TryGetCharacter(session.OriginalContentId, out _))
+        {
+            session.CurrentLeg = HandoffLeg.AutoRetainer;
+            session.ReturningForAutoRetainer = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "Returning to the registered original character before chained AutoRetainer work.");
+            return;
+        }
+
+        session.AutoRetainerLegSkipped = true;
+        save();
+        SetPhase(HandoffPhase.ReturningOriginal, reason: "No registered current or original character is available for chained AutoRetainer work.");
+    }
+
+    private bool TryStartChainedOceanFishing(HandoffSession session, DateTime now, OceanFishingScheduleState oceanState)
+    {
+        if (now >= oceanState.Window.LaunchCutoffUtc)
+        {
+            session.OceanFishingLegSkipped = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "AutoRetainer finished after the Ocean Fishing launch cutoff; skipping this voyage.");
+            return false;
+        }
+
+        if (monitoring.AutoRetainerAvailable != true || monitoring.AutoRetainerBusy || monitoring.AutoRetainerMultiModeActive)
+        {
+            Wait(now, "Waiting for AutoRetainer to become idle before starting chained Ocean Fishing.");
+            return false;
+        }
+
+        if (monitoring.LifestreamAvailable != true || monitoring.LifestreamBusy)
+        {
+            Wait(now, "Waiting for Lifestream to become idle before starting chained Ocean Fishing.");
+            return false;
+        }
+
+        if (monitoring.HenchmanAvailable != true || monitoring.HenchmanBusy)
+        {
+            Wait(now, "Waiting for Henchman to become idle before starting chained Ocean Fishing.");
+            return false;
+        }
+
+        if (monitoring.PlayerBlockers.Count > 0)
+        {
+            Wait(now, $"Waiting for a safe player state before chained Ocean Fishing; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(monitoring.PlayerBlockers)}.");
+            return false;
+        }
+
+        session.CurrentLeg = HandoffLeg.OceanFishing;
+        session.OceanWindowStartUtc = oceanState.Window.StartUtc;
+        session.HenchmanStartRequested = false;
+        session.HenchmanStartObserved = false;
+        session.OceanDutyStarted = false;
+        session.OceanDutyCompleted = false;
+        session.HenchmanStopRequested = false;
+        session.HenchmanStopConfirmed = false;
+        ResetOceanCleanupStability();
+        save();
+        log.Information("Starting chained Ocean Fishing without resuming Questionable. Session={Session} WindowStartUtc={WindowStartUtc}.", SessionId(), oceanState.Window.StartUtc);
+        StartHenchman(session);
+        return true;
+    }
+
+    private AutoRetainerPassMode? GetConfiguredAutoRetainerMode() =>
+        (configuration.MonitorRetainers, configuration.MonitorDeployables) switch
+        {
+            (true, true) => AutoRetainerPassMode.Everything,
+            (true, false) => AutoRetainerPassMode.Retainers,
+            (false, true) => AutoRetainerPassMode.Deployables,
+            _ => null,
+        };
+
     private bool MaintainYesAlreadyLease(HandoffSession session, DateTime now)
     {
         if (!session.YesAlreadyLeaseRequired)
@@ -712,7 +959,7 @@ public sealed class HandoffController : IDisposable
     private void UpdateWaitingForHenchmanStart(DateTime now)
     {
         var session = configuration.ActiveSession;
-        if (session is not { Kind: HandoffKind.OceanFishing })
+        if (session is null || !IsOceanLeg(session))
         {
             Fail("Ocean Fishing handoff data is missing.");
             return;
@@ -748,7 +995,7 @@ public sealed class HandoffController : IDisposable
     private void UpdateWaitingForOceanDuty(DateTime now)
     {
         var session = configuration.ActiveSession;
-        if (session is not { Kind: HandoffKind.OceanFishing })
+        if (session is null || !IsOceanLeg(session))
         {
             Fail("Ocean Fishing handoff data is missing.");
             return;
@@ -802,7 +1049,7 @@ public sealed class HandoffController : IDisposable
     private void UpdateWaitingForOceanCleanup(DateTime now)
     {
         var session = configuration.ActiveSession;
-        if (session is not { Kind: HandoffKind.OceanFishing, OceanDutyCompleted: true })
+        if (session is null || !IsOceanLeg(session) || !session.OceanDutyCompleted)
         {
             Fail("Ocean Fishing cleanup started without a completed voyage.");
             return;
@@ -881,7 +1128,7 @@ public sealed class HandoffController : IDisposable
         {
             session.HenchmanStopConfirmed = true;
             save();
-            SetPhase(HandoffPhase.ReturningOriginal, reason: "Henchman already finished after Ocean Fishing cleanup.");
+            CompleteOceanFishingLeg(session, "Henchman already finished after Ocean Fishing cleanup.");
             return;
         }
 
@@ -910,7 +1157,7 @@ public sealed class HandoffController : IDisposable
     private void UpdateWaitingForHenchmanStop(DateTime now)
     {
         var session = configuration.ActiveSession;
-        if (session is not { Kind: HandoffKind.OceanFishing })
+        if (session is null || !IsOceanLeg(session))
         {
             Fail("Ocean Fishing handoff data is missing while stopping Henchman.");
             return;
@@ -936,7 +1183,20 @@ public sealed class HandoffController : IDisposable
 
         session.HenchmanStopConfirmed = true;
         save();
-        SetPhase(HandoffPhase.ReturningOriginal, reason: "Henchman stopped after Ocean Fishing cleanup.");
+        CompleteOceanFishingLeg(session, "Henchman stopped after Ocean Fishing cleanup.");
+    }
+
+    private void CompleteOceanFishingLeg(HandoffSession session, string reason)
+    {
+        session.OceanFishingLegCompleted = true;
+        session.CurrentLeg = HandoffLeg.None;
+        session.ReturningForAutoRetainer = false;
+        if (session.OceanWindowStartUtc is { } windowStart)
+            configuration.LastHandledOceanFishingWindowUtc = windowStart;
+        ReleaseYesAlreadyLease(session);
+        save();
+        log.Information("Ocean Fishing leg complete; checking chained work. Session={Session}.", SessionId());
+        SetPhase(HandoffPhase.CheckingChainedWork, reason: reason);
     }
 
     private void UpdateWaitingForAutoRetainerIdle(DateTime now)
@@ -969,7 +1229,7 @@ public sealed class HandoffController : IDisposable
 
         if (completionEventReceived || session.AutoRetainerCompletionReceived)
         {
-            SetPhase(HandoffPhase.ReturningOriginal, reason: "AutoRetainer completion already received; returning to the original character.");
+            CompleteAutoRetainerLeg(session, "AutoRetainer completion already received; checking chained work.");
             return;
         }
 
@@ -1004,11 +1264,19 @@ public sealed class HandoffController : IDisposable
         completionEventReceived = false;
         save();
 
-        var mode = configuration.MonitorRetainers && configuration.MonitorDeployables
-                       ? MultiModeType.Everything
-                       : configuration.MonitorRetainers
-                           ? MultiModeType.Retainers
-                           : MultiModeType.Submersibles;
+        var mode = session.PendingAutoRetainerMode switch
+        {
+            AutoRetainerPassMode.Everything => MultiModeType.Everything,
+            AutoRetainerPassMode.Retainers => MultiModeType.Retainers,
+            AutoRetainerPassMode.Deployables => MultiModeType.Submersibles,
+            _ => GetConfiguredAutoRetainerMode() switch
+            {
+                AutoRetainerPassMode.Everything => MultiModeType.Everything,
+                AutoRetainerPassMode.Retainers => MultiModeType.Retainers,
+                AutoRetainerPassMode.Deployables => MultiModeType.Submersibles,
+                _ => MultiModeType.Everything,
+            },
+        };
         if (!autoRetainer.TryEnableSinglePass(mode))
         {
             Fail("AutoRetainer rejected the single-pass Multi Mode request.");
@@ -1057,7 +1325,7 @@ public sealed class HandoffController : IDisposable
 
         if (session.AutoRetainerCompletionReceived || autoRetainerMultiModeObserved || session.AutoRetainerMultiModeObserved)
         {
-            SetPhase(HandoffPhase.ReturningOriginal, reason: "AutoRetainer pass completed; returning to the original character.");
+            CompleteAutoRetainerLeg(session, "AutoRetainer pass completed; checking chained work.");
             return;
         }
 
@@ -1070,7 +1338,18 @@ public sealed class HandoffController : IDisposable
             return;
         }
 
-        SetPhase(HandoffPhase.ReturningOriginal);
+        CompleteAutoRetainerLeg(session, "AutoRetainer pass completed; checking chained work.");
+    }
+
+    private void CompleteAutoRetainerLeg(HandoffSession session, string reason)
+    {
+        session.AutoRetainerLegCompleted = true;
+        session.CurrentLeg = HandoffLeg.None;
+        session.PendingAutoRetainerMode = null;
+        session.ReturningForAutoRetainer = false;
+        save();
+        log.Information("AutoRetainer leg complete; checking chained work. Session={Session}.", SessionId());
+        SetPhase(HandoffPhase.CheckingChainedWork, reason: reason);
     }
 
     private void UpdateReturningOriginal(DateTime now)
@@ -1091,7 +1370,9 @@ public sealed class HandoffController : IDisposable
         if (clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId)
         {
             if (IsSafeForHandoff())
-                SetPhase(GetResumePhase());
+                SetPhase(session.ReturningForAutoRetainer
+                             ? HandoffPhase.WaitingForAutoRetainerIdle
+                             : GetResumePhase());
             else
                 Wait(now, $"Waiting on original character for a safe state; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(CapturePlayerBlockers())}.");
             return;
@@ -1148,7 +1429,9 @@ public sealed class HandoffController : IDisposable
         }
 
         if (clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId && IsSafeForHandoff())
-            SetPhase(GetResumePhase());
+            SetPhase(session.ReturningForAutoRetainer
+                         ? HandoffPhase.WaitingForAutoRetainerIdle
+                         : GetResumePhase());
         else if (!clientState.IsLoggedIn)
             Wait(now, "Waiting for the original character to finish logging in.");
         else if (playerState.ContentId != session.OriginalContentId)
@@ -1310,7 +1593,20 @@ public sealed class HandoffController : IDisposable
         }
 
         EnsureCorrelationId(session);
-        if (session.Kind == HandoffKind.OceanFishing)
+        if (session.Phase == HandoffPhase.CheckingChainedWork)
+        {
+            recoveryPending = false;
+            var onOriginalDuringChain = clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId;
+            SetPhase(
+                onOriginalDuringChain
+                    ? HandoffPhase.AwaitingManualQuestionableResume
+                    : HandoffPhase.ReturningOriginal,
+                reason: "Recovered between chained legs; optional chained work will not be dispatched after reload.");
+            Notify("Recovered between chained legs. Manual Questionable resume is required.", NotificationType.Warning);
+            return;
+        }
+
+        if (IsOceanLeg(session))
         {
             TryInitializeOceanRecovery(session);
             return;
@@ -1496,8 +1792,12 @@ public sealed class HandoffController : IDisposable
         monitoring.OceanLaunchEligible = configuration.MonitorOceanFishing && oceanState.LaunchEligible && !monitoring.OceanWindowHandled;
         monitoring.ActiveHandoffKind = configuration.ActiveSession?.Kind;
         var session = configuration.ActiveSession;
-        monitoring.OceanDutyStarted = session?.Kind == HandoffKind.OceanFishing && session.OceanDutyStarted;
-        monitoring.OceanDutyCompleted = session?.Kind == HandoffKind.OceanFishing && session.OceanDutyCompleted;
+        monitoring.CurrentHandoffLeg = session?.CurrentLeg;
+        monitoring.OceanLegResolved = session?.OceanFishingLegCompleted == true || session?.OceanFishingLegSkipped == true;
+        monitoring.AutoRetainerLegResolved = session?.AutoRetainerLegCompleted == true || session?.AutoRetainerLegSkipped == true;
+        monitoring.PendingAutoRetainerMode = session?.PendingAutoRetainerMode;
+        monitoring.OceanDutyStarted = session is not null && IsOceanLeg(session) && session.OceanDutyStarted;
+        monitoring.OceanDutyCompleted = session is not null && IsOceanLeg(session) && session.OceanDutyCompleted;
         monitoring.LastDependencyCheckUtc = now;
         lastDependencyRefreshUtc = now;
     }
@@ -1562,6 +1862,11 @@ public sealed class HandoffController : IDisposable
         IsOceanFishingTerritory() &&
         (dutyState.IsDutyStarted || condition[ConditionFlag.BoundByDuty]);
 
+    private static bool IsOceanLeg(HandoffSession? session) =>
+        session is not null &&
+        (session.CurrentLeg == HandoffLeg.OceanFishing ||
+         (session.Kind == HandoffKind.OceanFishing && !session.OceanFishingLegCompleted && !session.OceanFishingLegSkipped));
+
     private bool IsOceanFishingTerritory() =>
         clientState.TerritoryType is OceanFishingTerritoryOne or OceanFishingTerritoryTwo;
 
@@ -1624,7 +1929,7 @@ public sealed class HandoffController : IDisposable
     private void OnDutyStarted(IDutyStateEventArgs args)
     {
         var session = configuration.ActiveSession;
-        if (session is not { Kind: HandoffKind.OceanFishing, HenchmanStartObserved: true } || !IsOceanFishingTerritory())
+        if (session is null || !IsOceanLeg(session) || !session.HenchmanStartObserved || !IsOceanFishingTerritory())
             return;
 
         if (session.OceanDutyStarted)
@@ -1639,7 +1944,7 @@ public sealed class HandoffController : IDisposable
     private void OnDutyCompleted(IDutyStateEventArgs args)
     {
         var session = configuration.ActiveSession;
-        if (session is not { Kind: HandoffKind.OceanFishing, OceanDutyStarted: true } || session.OceanDutyCompleted)
+        if (session is null || !IsOceanLeg(session) || !session.OceanDutyStarted || session.OceanDutyCompleted)
             return;
 
         session.OceanDutyCompleted = true;
@@ -1739,13 +2044,15 @@ public sealed class HandoffController : IDisposable
         Notify(
             alreadyRunning
                 ? "Recovery complete. Questionable is already running."
-                : session?.Kind == HandoffKind.OceanFishing
+                : session?.OceanFishingLegCompleted == true
                     ? "Ocean Fishing complete. Questionable resumed."
                     : "AutoRetainer pass complete. Questionable resumed.");
-        if (session?.Kind == HandoffKind.OceanFishing)
+        if (session is not null)
+        {
             ReleaseYesAlreadyLease(session);
-        if (session?.Kind == HandoffKind.OceanFishing && session.OceanWindowStartUtc is { } windowStart)
-            configuration.LastHandledOceanFishingWindowUtc = windowStart;
+            if (session.OceanWindowStartUtc is { } windowStart)
+                configuration.LastHandledOceanFishingWindowUtc = windowStart;
+        }
         configuration.ActiveSession = null;
         ResetOceanCleanupStability();
         ResetReadinessDiagnostics();
@@ -1778,6 +2085,11 @@ public sealed class HandoffController : IDisposable
     private void ResetReadinessDiagnostics()
     {
         ReadyCharacterCount = 0;
+        monitoring.ActiveHandoffKind = null;
+        monitoring.CurrentHandoffLeg = null;
+        monitoring.OceanLegResolved = false;
+        monitoring.AutoRetainerLegResolved = false;
+        monitoring.PendingAutoRetainerMode = null;
         monitoring.RegisteredCharacterCount = 0;
         monitoring.ReadyCharacterCount = 0;
         monitoring.ClosestRetainerSeconds = null;
@@ -1793,7 +2105,7 @@ public sealed class HandoffController : IDisposable
     {
         if (configuration.ActiveSession is null)
             configuration.ActiveSession = new HandoffSession();
-        else if (configuration.ActiveSession.Kind == HandoffKind.OceanFishing)
+        else if (configuration.ActiveSession.YesAlreadyLeaseAcquired)
             ReleaseYesAlreadyLease(configuration.ActiveSession);
         EnsureCorrelationId(configuration.ActiveSession);
         log.Error("Questionable Retainer stopped. Session={Session} Message={Message}.", SessionId(), message);
@@ -1894,6 +2206,28 @@ public sealed class HandoffController : IDisposable
             return;
 
         session.CorrelationId = CreateCorrelationId();
+        save();
+    }
+
+    private void NormalizeSession(HandoffSession session)
+    {
+        if (session.SessionVersion >= 4)
+            return;
+
+        session.SessionVersion = 4;
+        if (session.CurrentLeg == HandoffLeg.None)
+        {
+            session.CurrentLeg = session.Kind == HandoffKind.OceanFishing || session.Phase is
+                HandoffPhase.WaitingForHenchmanStart or
+                HandoffPhase.WaitingForOceanDuty or
+                HandoffPhase.WaitingForOceanCleanup or
+                HandoffPhase.WaitingForHenchmanStop
+                    ? HandoffLeg.OceanFishing
+                    : HandoffLeg.AutoRetainer;
+        }
+
+        if (session.CurrentLeg == HandoffLeg.AutoRetainer && session.PendingAutoRetainerMode is null)
+            session.PendingAutoRetainerMode = GetConfiguredAutoRetainerMode();
         save();
     }
 
