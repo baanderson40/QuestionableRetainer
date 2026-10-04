@@ -15,5 +15,6 @@
         <Compile Include="..\QuestionableRetainer\Automation\QuestionableStopPolicy.cs" Link="Automation\QuestionableStopPolicy.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\MonitoringStatus.cs" Link="Automation\MonitoringStatus.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\ReadinessEvaluator.cs" Link="Automation\ReadinessEvaluator.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\RecoveryPolicy.cs" Link="Automation\RecoveryPolicy.cs" />
     </ItemGroup>
 </Project>

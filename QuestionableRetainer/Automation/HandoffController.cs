@@ -60,6 +60,7 @@ public sealed class HandoffController : IDisposable
     private bool questionablePausedThisRuntime;
     private bool manualResumeAuthorized;
     private bool offFrameworkUpdateLogged;
+    private bool henchmanOwnedThisRuntime;
 
     public HandoffController(
         Configuration configuration,
@@ -126,7 +127,7 @@ public sealed class HandoffController : IDisposable
 
     public int ReadyCharacterCount { get; private set; }
 
-    public string LastError => configuration.ActiveSession?.LastError ?? string.Empty;
+    public string LastError => configuration.ActiveSession?.LastError ?? configuration.ManualRecoveryMessage;
 
     public HandoffSession? Session => configuration.ActiveSession;
 
@@ -191,6 +192,9 @@ public sealed class HandoffController : IDisposable
             case HandoffPhase.CheckingChainedWork:
                 UpdateCheckingChainedWork(now);
                 break;
+            case HandoffPhase.RecoveringHandoff:
+                UpdateRecoveringHandoff(now);
+                break;
             case HandoffPhase.WaitingForAutoRetainerIdle:
                 UpdateWaitingForAutoRetainerIdle(now);
                 break;
@@ -213,6 +217,9 @@ public sealed class HandoffController : IDisposable
                 SetMonitoring(MonitoringState.Recovering, monitoring.Reason, now);
                 break;
             case HandoffPhase.Error:
+                SetMonitoring(MonitoringState.Error, monitoring.Reason, now);
+                break;
+            case HandoffPhase.ManualIntervention:
                 SetMonitoring(MonitoringState.Error, monitoring.Reason, now);
                 break;
         }
@@ -239,10 +246,13 @@ public sealed class HandoffController : IDisposable
         }
 
         configuration.ActiveSession.LastError = string.Empty;
-        recoveryPending = true;
+        configuration.ActiveSession.RecoveryNextAttemptUtc = DateTime.UtcNow;
+        recoveryPending = false;
+        if (Phase is HandoffPhase.Error or HandoffPhase.ManualIntervention)
+            SetPhase(HandoffPhase.RecoveringHandoff, reason: "Manual retry requested.");
         nextUpdateUtc = DateTime.MinValue;
         save();
-        log.Information("Recovery requested. Session={Session} Phase={Phase}.", SessionId(), Phase);
+        log.Information("Recovery retry requested. Session={Session} Phase={Phase}.", SessionId(), Phase);
     }
 
     public void ResumeQuestionable() => DispatchToFrameworkThread(ResumeQuestionableCore, nameof(ResumeQuestionable));
@@ -267,7 +277,7 @@ public sealed class HandoffController : IDisposable
 
     private void CancelRecoveryCore()
     {
-        if (Phase is not (HandoffPhase.Error or HandoffPhase.AwaitingManualQuestionableResume))
+        if (Phase is not (HandoffPhase.Error or HandoffPhase.ManualIntervention or HandoffPhase.AwaitingManualQuestionableResume))
         {
             log.Information("Discard command ignored. Session={Session} Phase={Phase}.", SessionId(), Phase);
             return;
@@ -294,6 +304,7 @@ public sealed class HandoffController : IDisposable
         if (IsOceanLeg(session) && session.OceanWindowStartUtc is { } windowStart)
             configuration.LastHandledOceanFishingWindowUtc = windowStart;
         configuration.ActiveSession = null;
+        configuration.ManualRecoveryMessage = string.Empty;
         ReadyCharacterCount = 0;
         SetPhase(HandoffPhase.Idle, persist: false);
         save();
@@ -475,7 +486,7 @@ public sealed class HandoffController : IDisposable
 
         var session = new HandoffSession
         {
-            SessionVersion = 4,
+            SessionVersion = 5,
             Kind = HandoffKind.AutoRetainer,
             CurrentLeg = HandoffLeg.AutoRetainer,
             PendingAutoRetainerMode = GetConfiguredAutoRetainerMode(),
@@ -555,7 +566,7 @@ public sealed class HandoffController : IDisposable
 
         var session = new HandoffSession
         {
-            SessionVersion = 4,
+            SessionVersion = 5,
             Kind = HandoffKind.OceanFishing,
             CurrentLeg = HandoffLeg.OceanFishing,
             CorrelationId = CreateCorrelationId(),
@@ -1008,6 +1019,8 @@ public sealed class HandoffController : IDisposable
         }
 
         session.HenchmanStartObserved = true;
+        henchmanOwnedThisRuntime = true;
+        session.HenchmanOwnership = HenchmanOwnership.OwnedThisRuntime;
         save();
         log.Information("Henchman On A Boat ownership confirmed. Session={Session}.", SessionId());
         SetPhase(HandoffPhase.WaitingForOceanDuty);
@@ -1614,6 +1627,13 @@ public sealed class HandoffController : IDisposable
         }
 
         EnsureCorrelationId(session);
+        if (session.Phase == HandoffPhase.RecoveringHandoff)
+        {
+            recoveryPending = false;
+            henchmanOwnedThisRuntime = false;
+            SetPhase(HandoffPhase.RecoveringHandoff, reason: "Resuming persisted automatic handoff recovery.");
+            return;
+        }
         if (session.Phase == HandoffPhase.CheckingChainedWork)
         {
             recoveryPending = false;
@@ -2027,8 +2047,13 @@ public sealed class HandoffController : IDisposable
             configuration.ActiveSession.Phase = phase;
         if (persist)
             save();
-        if (phase == HandoffPhase.Error)
+        if (phase is HandoffPhase.Error or HandoffPhase.ManualIntervention)
             SetMonitoring(MonitoringState.Error, reason ?? monitoring.Reason, now);
+        else if (phase == HandoffPhase.RecoveringHandoff)
+        {
+            RefreshLiveDiagnostics(now);
+            SetMonitoring(MonitoringState.Recovering, reason ?? "Automatic recovery in progress.", now);
+        }
         else if (phase == HandoffPhase.AwaitingManualQuestionableResume)
         {
             SetMonitoring(
@@ -2084,6 +2109,7 @@ public sealed class HandoffController : IDisposable
                 configuration.LastHandledOceanFishingWindowUtc = windowStart;
         }
         configuration.ActiveSession = null;
+        configuration.ManualRecoveryMessage = string.Empty;
         ResetOceanCleanupStability();
         ResetReadinessDiagnostics();
         monitoring.PlayerBlockers = [];
@@ -2104,12 +2130,229 @@ public sealed class HandoffController : IDisposable
 
         log.Warning("{Reason} Session={Session}.", reason, SessionId());
         Notify(reason, NotificationType.Warning);
+        if (configuration.ActiveSession is { } staleSession)
+            ReleaseYesAlreadyLease(staleSession);
         configuration.ActiveSession = null;
+        configuration.ManualRecoveryMessage = string.Empty;
         ResetReadinessDiagnostics();
         lastActionUtc = DateTime.MinValue;
         SetPhase(HandoffPhase.Idle, persist: false);
         SetMonitoring(MonitoringState.WaitingForReadyWork, "Recovery superseded; readiness rescan pending.", DateTime.UtcNow);
         save();
+    }
+
+    private void UpdateRecoveringHandoff(DateTime now)
+    {
+        var session = configuration.ActiveSession;
+        if (session is null)
+        {
+            EnterManualIntervention("Recovery data disappeared while automatic recovery was active.");
+            return;
+        }
+
+        if (session.RecoveryAction == RecoveryAction.ManualIntervention)
+        {
+            EnterManualIntervention(session.RecoveryMessage);
+            return;
+        }
+
+        if (session.RecoveryNextAttemptUtc is { } nextAttempt && now < nextAttempt)
+        {
+            Wait(now, $"Automatic recovery waiting before retry {session.RecoveryAttemptCount + 1}.");
+            return;
+        }
+
+        session.RecoveryAttemptCount++;
+        session.RecoveryLastAttemptUtc = now;
+        session.RecoveryNextAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.RecoveryAttemptCount);
+        save();
+
+        switch (session.RecoveryAction)
+        {
+            case RecoveryAction.RetryCurrentPhase:
+                ClearRecoveryAttempt(session);
+                SetPhase(session.RecoveryOriginPhase, reason: "Retrying recoverable handoff operation.");
+                return;
+
+            case RecoveryAction.AbandonUnstartedHandoff:
+                AbandonUnstartedHandoff(session);
+                return;
+
+            case RecoveryAction.SkipCurrentLeg:
+                SkipCurrentLegAndContinue(session);
+                return;
+
+            case RecoveryAction.WaitForActiveAutomation:
+                if (IsOceanLeg(session))
+                {
+                    if (IsOceanFishingDutyActive() || (henchman.TryGetState(out var oceanBusy) && oceanBusy))
+                    {
+                        Wait(now, "Waiting for active Ocean Fishing automation to finish; QR will not preempt it.");
+                        return;
+                    }
+
+                    SkipCurrentLegAndContinue(session);
+                    return;
+                }
+
+                if (!TryGetAutoRetainerState(out var autoBusy, out var multiModeActive))
+                {
+                    Wait(now, "Waiting for AutoRetainer state before resolving recovery.");
+                    return;
+                }
+
+                if (autoBusy || multiModeActive)
+                {
+                    Wait(now, "Waiting for active AutoRetainer automation to finish.");
+                    return;
+                }
+
+                SkipCurrentLegAndContinue(session);
+                return;
+
+            case RecoveryAction.CancelHenchmanThenRestore:
+                UpdateHenchmanCancellationRecovery(session, now);
+                return;
+
+            case RecoveryAction.ReturnOriginalAndResume:
+                ClearRecoveryAttempt(session);
+                if (clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId && IsSafeForHandoff())
+                    SetPhase(GetResumePhase(), reason: "Handoff recovered; restoring Questionable.");
+                else
+                    SetPhase(HandoffPhase.ReturningOriginal, reason: "Handoff recovered; returning to the original character.");
+                return;
+
+            default:
+                EnterManualIntervention(session.RecoveryMessage);
+                return;
+        }
+    }
+
+    private void UpdateHenchmanCancellationRecovery(HandoffSession session, DateTime now)
+    {
+        if (IsOceanFishingDutyActive())
+        {
+            session.RecoveryAction = RecoveryAction.WaitForActiveAutomation;
+            session.RecoveryNextAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.RecoveryAttemptCount);
+            save();
+            Wait(now, "Ocean Fishing duty is active; waiting before safe Henchman recovery.");
+            return;
+        }
+
+        if (!henchman.TryGetState(out var busy))
+        {
+            Wait(now, "Waiting for Henchman state before automatic recovery.");
+            return;
+        }
+
+        if (!busy)
+        {
+            session.OceanAbortConfirmed = true;
+            session.HenchmanStopConfirmed = true;
+            SkipCurrentLegAndContinue(session);
+            return;
+        }
+
+        if (!henchmanOwnedThisRuntime)
+        {
+            session.RecoveryAction = RecoveryAction.WaitForActiveAutomation;
+            session.RecoveryNextAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.RecoveryAttemptCount);
+            save();
+            Wait(now, "Henchman ownership is not provable after reload; waiting without cancellation.");
+            return;
+        }
+
+        if (now < lastActionUtc + ActionRetryInterval)
+        {
+            Wait(now, "Waiting before retrying QR-owned Henchman cancellation.");
+            return;
+        }
+
+        lastActionUtc = now;
+        session.OceanAbortRequested = true;
+        session.HenchmanStopRequested = true;
+        if (!henchman.TryCancelAllTasks(out var error))
+        {
+            log.Warning("Automatic Henchman cancellation will retry. Session={Session} Error={Error}.", SessionId(), error);
+            Wait(now, $"Henchman cancellation unavailable; retrying automatically: {error}");
+            return;
+        }
+
+        session.HenchmanOwnership = HenchmanOwnership.CancellationRequested;
+        save();
+        Wait(now, "QR-owned Henchman cancellation requested; waiting for idle.");
+    }
+
+    private void AbandonUnstartedHandoff(HandoffSession session)
+    {
+        ReleaseYesAlreadyLease(session);
+        configuration.ActiveSession = null;
+        lastActionUtc = DateTime.MinValue;
+        SetPhase(HandoffPhase.Idle, persist: false);
+        SetMonitoring(MonitoringState.WaitingForReadyWork, "Handoff abandoned safely; readiness rescan pending.", DateTime.UtcNow);
+        save();
+        Notify("Handoff abandoned safely; Questionable remains in control.", NotificationType.Warning);
+    }
+
+    private void SkipCurrentLegAndContinue(HandoffSession session)
+    {
+        if (IsOceanLeg(session))
+        {
+            session.OceanFishingLegSkipped = !session.OceanDutyCompleted;
+            session.OceanFishingLegCompleted = session.OceanDutyCompleted;
+            session.OceanWindowConsumed = true;
+            session.HenchmanStopConfirmed = true;
+            session.CurrentLeg = HandoffLeg.None;
+            if (session.OceanWindowStartUtc is { } windowStart)
+                configuration.LastHandledOceanFishingWindowUtc = windowStart;
+            ReleaseYesAlreadyLease(session);
+        }
+        else if (session.CurrentLeg == HandoffLeg.AutoRetainer)
+        {
+            session.AutoRetainerLegSkipped = !session.AutoRetainerMultiModeObserved && !session.AutoRetainerCompletionReceived;
+            session.AutoRetainerLegCompleted = !session.AutoRetainerLegSkipped;
+            session.PendingAutoRetainerMode = null;
+            session.CurrentLeg = HandoffLeg.None;
+        }
+
+        ClearRecoveryAttempt(session);
+        save();
+        SetPhase(HandoffPhase.CheckingChainedWork, reason: "Recoverable handoff leg resolved; checking remaining work.");
+    }
+
+    private void ClearRecoveryAttempt(HandoffSession session)
+    {
+        session.RecoveryAction = RecoveryAction.None;
+        session.RecoveryFailureCode = null;
+        session.RecoveryOriginPhase = HandoffPhase.Idle;
+        session.RecoveryOriginLeg = HandoffLeg.None;
+        session.RecoveryStartedUtc = null;
+        session.RecoveryNextAttemptUtc = null;
+        session.RecoveryLastAttemptUtc = null;
+        session.RecoveryAttemptCount = 0;
+        session.RecoveryMessage = string.Empty;
+        session.LastError = string.Empty;
+    }
+
+    private void EnterManualIntervention(string message)
+    {
+        if (configuration.ActiveSession is { } session)
+        {
+            session.RecoveryAction = RecoveryAction.ManualIntervention;
+            session.RecoveryMessage = message;
+            session.LastError = message;
+            ReleaseYesAlreadyLease(session);
+            save();
+        }
+        else
+        {
+            configuration.ManualRecoveryMessage = message;
+            save();
+        }
+
+        monitoring.Reason = message;
+        SetPhase(HandoffPhase.ManualIntervention, reason: message);
+        Notify(message, NotificationType.Error);
     }
 
     private void ResetReadinessDiagnostics()
@@ -2129,20 +2372,110 @@ public sealed class HandoffController : IDisposable
         monitoring.TriggerReadyCharacterCount = null;
         monitoring.TriggerClosestRetainerSeconds = null;
         monitoring.TriggerDetectedUtc = null;
+        monitoring.RecoveryAction = RecoveryAction.None;
+        monitoring.RecoveryFailureCode = null;
+        monitoring.RecoveryAttemptCount = 0;
+        monitoring.RecoveryNextAttemptUtc = null;
     }
 
     private void Fail(string message)
     {
-        if (configuration.ActiveSession is null)
-            configuration.ActiveSession = new HandoffSession();
-        else if (configuration.ActiveSession.YesAlreadyLeaseAcquired)
-            ReleaseYesAlreadyLease(configuration.ActiveSession);
-        EnsureCorrelationId(configuration.ActiveSession);
-        log.Error("Questionable Retainer stopped. Session={Session} Message={Message}.", SessionId(), message);
-        configuration.ActiveSession.LastError = message;
+        HandleFailure(ClassifyFailure(message), message);
+    }
+
+    private void HandleFailure(RecoveryFailureCode failure, string message)
+    {
+        var session = configuration.ActiveSession;
+        if (session is null)
+        {
+            log.Error("Questionable Retainer requires manual intervention. Session=none Message={Message}.", message);
+            EnterManualIntervention(message);
+            return;
+        }
+
+        EnsureCorrelationId(session);
+        var now = DateTime.UtcNow;
+        var phase = Phase;
+        var leg = session.CurrentLeg;
+        if (failure is RecoveryFailureCode.MissingSession or RecoveryFailureCode.ContradictorySession)
+        {
+            EnterManualIntervention(message);
+            return;
+        }
+
+        var henchmanKnown = henchman.TryGetState(out var henchmanBusy);
+        var autoKnown = TryGetAutoRetainerState(out var autoBusy, out var multiModeActive);
+        var dutyActive = IsOceanFishingDutyActive();
+        var decision = RecoveryPolicy.Decide(new(
+            failure,
+            phase,
+            leg,
+            SessionValid: true,
+            henchmanKnown,
+            henchmanBusy,
+            henchmanOwnedThisRuntime,
+            dutyActive,
+            session.OceanDutyStarted,
+            session.OceanDutyCompleted,
+            autoKnown,
+            autoBusy,
+            multiModeActive,
+            session.AutoRetainerMultiModeObserved || session.AutoRetainerCompletionReceived,
+            clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId,
+            IsSafeForHandoff()));
+        var action = decision.Action;
+
+        if (!henchmanKnown && leg == HandoffLeg.OceanFishing &&
+            failure is (RecoveryFailureCode.HenchmanStateUnavailable or RecoveryFailureCode.HenchmanCancellation))
+            action = RecoveryAction.RetryCurrentPhase;
+        if (!autoKnown && leg == HandoffLeg.AutoRetainer)
+            action = RecoveryAction.RetryCurrentPhase;
+
+        session.RecoveryFailureCode = failure;
+        session.RecoveryAction = action;
+        session.RecoveryOriginPhase = phase;
+        session.RecoveryOriginLeg = leg;
+        session.RecoveryStartedUtc ??= now;
+        session.RecoveryAttemptCount = 0;
+        session.RecoveryNextAttemptUtc = now;
+        session.RecoveryMessage = message;
+        session.LastError = message;
         monitoring.Reason = message;
-        SetPhase(HandoffPhase.Error, reason: message);
-        Notify(message, NotificationType.Error);
+        save();
+        log.Warning(
+            "Questionable Retainer entered automatic recovery. Session={Session} Failure={Failure} Action={Action} OriginPhase={Phase} Message={Message}.",
+            SessionId(),
+            failure,
+            action,
+            phase,
+            message);
+        SetPhase(HandoffPhase.RecoveringHandoff, reason: $"Automatic recovery: {message}");
+        Notify($"Automatic recovery started: {message}", NotificationType.Warning);
+    }
+
+    private RecoveryFailureCode ClassifyFailure(string message)
+    {
+        if (message.Contains("Recovery data is missing", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("handoff data is missing", StringComparison.OrdinalIgnoreCase))
+            return RecoveryFailureCode.MissingSession;
+        if (Phase == HandoffPhase.WaitingForQuestionable)
+            return message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+                       ? RecoveryFailureCode.QuestionableStopTimeout
+                       : RecoveryFailureCode.QuestionableStop;
+        if (message.Contains("Questionable", StringComparison.OrdinalIgnoreCase))
+            return RecoveryFailureCode.QuestionableResume;
+        if (message.Contains("Henchman", StringComparison.OrdinalIgnoreCase))
+            return message.Contains("busy", StringComparison.OrdinalIgnoreCase)
+                ? RecoveryFailureCode.HenchmanConflict
+                : RecoveryFailureCode.HenchmanStateUnavailable;
+        if (message.Contains("AutoRetainer", StringComparison.OrdinalIgnoreCase))
+            return RecoveryFailureCode.AutoRetainerRunTimeout;
+        if (message.Contains("Lifestream", StringComparison.OrdinalIgnoreCase) ||
+            message.Contains("original character", StringComparison.OrdinalIgnoreCase))
+            return RecoveryFailureCode.LifestreamReturn;
+        if (message.Contains("YesAlready", StringComparison.OrdinalIgnoreCase))
+            return RecoveryFailureCode.YesAlreadyUnavailable;
+        return RecoveryFailureCode.Unknown;
     }
 
     private void Notify(string message, NotificationType type = NotificationType.Info)
@@ -2210,7 +2543,7 @@ public sealed class HandoffController : IDisposable
         lastLoggedMonitoringState = state;
         lastLoggedMonitoringReason = reason;
         lastMonitoringLogUtc = now;
-        log.Information(
+        log.Verbose(
             "Monitoring state: {State}. Session={Session} HandoffPhase={HandoffPhase} PhaseElapsedSeconds={PhaseElapsedSeconds:0.0} SessionElapsedSeconds={SessionElapsedSeconds:0.0}. WaitReason={WaitReason} QuestionableIPC={QuestionableIPC} Questionable={Questionable} Quest={Quest} AutoRetainer={AutoRetainer} Busy={AutoRetainerBusy} MultiMode={MultiMode} Lifestream={Lifestream} ReadinessScan={ReadinessScan} Registered={Registered} Ready={Ready} ClosestRetainerSeconds={ClosestRetainerSeconds} LastReadinessScanUtc={LastReadinessScanUtc} LastDependencyCheckUtc={LastDependencyCheckUtc} TriggerReady={TriggerReady} PlayerLoggedIn={PlayerLoggedIn} ContentId={ContentId} Blockers={Blockers}",
             state,
             SessionId(),
@@ -2269,10 +2602,10 @@ public sealed class HandoffController : IDisposable
 
     private void NormalizeSession(HandoffSession session)
     {
-        if (session.SessionVersion >= 4)
+        if (session.SessionVersion >= 5)
             return;
 
-        session.SessionVersion = 4;
+        session.SessionVersion = 5;
         if (session.CurrentLeg == HandoffLeg.None)
         {
             session.CurrentLeg = session.Kind == HandoffKind.OceanFishing || session.Phase is

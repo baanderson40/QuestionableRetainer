@@ -40,6 +40,11 @@ var tests = new (string Name, Action Test)[]
     ("chained planner selects AutoRetainer after Ocean", TestChainedAutoRetainer),
     ("chained planner returns when work is resolved", TestChainedReturn),
     ("chained planner skips Ocean after cutoff", TestChainedOceanCutoff),
+    ("recovery cancels owned pre-duty Henchman", TestRecoveryCancelsOwnedHenchman),
+    ("recovery never cancels foreign Henchman", TestRecoverySkipsForeignHenchman),
+    ("recovery waits for active AutoRetainer", TestRecoveryWaitsForAutoRetainer),
+    ("recovery skips unconfirmed AutoRetainer", TestRecoverySkipsUnconfirmedAutoRetainer),
+    ("recovery backoff is capped", TestRecoveryBackoff),
 };
 
 foreach (var (name, test) in tests)
@@ -410,6 +415,101 @@ static void TestChainedOceanCutoff()
             OceanWindowHandled: false,
             AutoRetainerMonitoringEnabled: true,
             AutoRetainerLegResolved: false)));
+}
+
+static void TestRecoveryCancelsOwnedHenchman()
+{
+    var decision = RecoveryPolicy.Decide(new(
+        RecoveryFailureCode.OceanDutyStartTimeout,
+        HandoffPhase.WaitingForOceanDuty,
+        HandoffLeg.OceanFishing,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true));
+    AssertEqual(RecoveryAction.CancelHenchmanThenRestore, decision.Action);
+}
+
+static void TestRecoverySkipsForeignHenchman()
+{
+    var decision = RecoveryPolicy.Decide(new(
+        RecoveryFailureCode.HenchmanConflict,
+        HandoffPhase.WaitingForHenchmanStart,
+        HandoffLeg.OceanFishing,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true));
+    AssertEqual(RecoveryAction.SkipCurrentLeg, decision.Action);
+}
+
+static void TestRecoveryWaitsForAutoRetainer()
+{
+    var decision = RecoveryPolicy.Decide(new(
+        RecoveryFailureCode.AutoRetainerRunTimeout,
+        HandoffPhase.WaitingForAutoRetainer,
+        HandoffLeg.AutoRetainer,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true));
+    AssertEqual(RecoveryAction.WaitForActiveAutomation, decision.Action);
+}
+
+static void TestRecoverySkipsUnconfirmedAutoRetainer()
+{
+    var decision = RecoveryPolicy.Decide(new(
+        RecoveryFailureCode.AutoRetainerStartAmbiguous,
+        HandoffPhase.WaitingForAutoRetainer,
+        HandoffLeg.AutoRetainer,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        true));
+    AssertEqual(RecoveryAction.SkipCurrentLeg, decision.Action);
+}
+
+static void TestRecoveryBackoff()
+{
+    AssertEqual(TimeSpan.FromSeconds(2), RecoveryBackoffPolicy.GetDelay(1));
+    AssertEqual(TimeSpan.FromSeconds(15), RecoveryBackoffPolicy.GetDelay(3));
+    AssertEqual(TimeSpan.FromMinutes(1), RecoveryBackoffPolicy.GetDelay(20));
 }
 
 static void AssertTrue(bool value)

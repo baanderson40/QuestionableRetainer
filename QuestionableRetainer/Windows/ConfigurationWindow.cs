@@ -67,6 +67,11 @@ public sealed class ConfigurationWindow : Window
         ImGui.TextUnformatted($"Henchman: {FormatAvailability(controller.Monitoring.HenchmanAvailable)} " +
                               $"Busy: {controller.Monitoring.HenchmanBusy}");
         ImGui.TextUnformatted($"YesAlready lease: {controller.Monitoring.YesAlreadyLeaseAcquired}");
+        ImGui.TextUnformatted($"Recovery: {controller.Monitoring.RecoveryAction} " +
+                              $"Failure: {controller.Monitoring.RecoveryFailureCode?.ToString() ?? "none"} " +
+                              $"Attempt: {controller.Monitoring.RecoveryAttemptCount}");
+        if (controller.Monitoring.RecoveryNextAttemptUtc is { } nextRecovery)
+            ImGui.TextUnformatted($"Next recovery attempt: {nextRecovery.ToLocalTime():HH:mm:ss}");
         ImGui.TextUnformatted($"Ocean Fishing: {FormatTimestamp(controller.Monitoring.NextOceanWindowUtc)} " +
                               $"Eligible: {controller.Monitoring.OceanLaunchEligible} " +
                               $"Handled: {controller.Monitoring.OceanWindowHandled}");
@@ -105,9 +110,9 @@ public sealed class ConfigurationWindow : Window
             if (ImGui.Button("Discard Recovery"))
                 controller.CancelRecovery();
         }
-        else if (controller.Phase == HandoffPhase.Error)
+        else if (controller.Phase is HandoffPhase.Error or HandoffPhase.ManualIntervention)
         {
-            if (ImGui.Button("Recover Handoff"))
+            if (ImGui.Button("Retry Now"))
                 controller.Recover();
             ImGui.SameLine();
             if (ImGui.Button("Discard Recovery"))

@@ -63,9 +63,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         ECommonsMain.Init(PluginInterface, this, Module.DalamudReflector);
         configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        if (configuration.Version < 2)
+        if (configuration.Version < 3)
         {
-            configuration.Version = 2;
+            configuration.Version = 3;
             SaveConfiguration();
         }
 
@@ -96,7 +96,7 @@ public sealed class Plugin : IDalamudPlugin
         configurationWindow = new ConfigurationWindow(configuration, controller, SaveConfiguration);
         windowSystem.AddWindow(configurationWindow);
         Log.Information(
-            "Questionable Retainer loaded. Monitoring enabled={Enabled}; retainers={Retainers}; deployables={Deployables}; oceanFishing={OceanFishing}.",
+            "Questionable Retainer plugin loaded. Monitoring enabled={Enabled}; retainers={Retainers}; deployables={Deployables}; oceanFishing={OceanFishing}.",
             configuration.Enabled,
             configuration.MonitorRetainers,
             configuration.MonitorDeployables,

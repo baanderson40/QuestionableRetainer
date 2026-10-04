@@ -17,6 +17,8 @@ public enum HandoffPhase
     WaitingForOceanCleanup,
     WaitingForHenchmanStop,
     CheckingChainedWork,
+    RecoveringHandoff,
+    ManualIntervention,
 }
 
 public enum HandoffKind
@@ -39,9 +41,56 @@ public enum AutoRetainerPassMode
     Everything,
 }
 
+public enum RecoveryAction
+{
+    None,
+    RetryCurrentPhase,
+    AbandonUnstartedHandoff,
+    SkipCurrentLeg,
+    CancelHenchmanThenRestore,
+    WaitForActiveAutomation,
+    ReturnOriginalAndResume,
+    ManualIntervention,
+}
+
+public enum RecoveryFailureCode
+{
+    Unknown,
+    QuestionableStop,
+    QuestionableStopTimeout,
+    YesAlreadyUnavailable,
+    HenchmanStateUnavailable,
+    HenchmanConflict,
+    HenchmanStartAmbiguous,
+    HenchmanStartTimeout,
+    OceanDutyStartTimeout,
+    OceanVoyageTimeout,
+    HenchmanStopped,
+    OceanCleanupStateInvalid,
+    HenchmanCancellation,
+    AutoRetainerBusyTimeout,
+    AutoRetainerStartAmbiguous,
+    AutoRetainerRunTimeout,
+    LifestreamReturn,
+    OriginalLoginTimeout,
+    QuestionableResume,
+    MissingSession,
+    ContradictorySession,
+}
+
+public enum HenchmanOwnership
+{
+    None,
+    StartIntentPersisted,
+    OwnedThisRuntime,
+    Ambiguous,
+    CancellationRequested,
+    Stopped,
+}
+
 public sealed class HandoffSession
 {
-    public int SessionVersion { get; set; } = 4;
+    public int SessionVersion { get; set; } = 5;
 
     public string CorrelationId { get; set; } = string.Empty;
 
@@ -114,6 +163,34 @@ public sealed class HandoffSession
     public bool HenchmanStopConfirmed { get; set; }
 
     public string LastError { get; set; } = string.Empty;
+
+    public string RecoveryMessage { get; set; } = string.Empty;
+
+    public RecoveryAction RecoveryAction { get; set; }
+
+    public RecoveryFailureCode? RecoveryFailureCode { get; set; }
+
+    public HandoffPhase RecoveryOriginPhase { get; set; }
+
+    public HandoffLeg RecoveryOriginLeg { get; set; }
+
+    public DateTime? RecoveryStartedUtc { get; set; }
+
+    public DateTime? RecoveryNextAttemptUtc { get; set; }
+
+    public DateTime? RecoveryLastAttemptUtc { get; set; }
+
+    public int RecoveryAttemptCount { get; set; }
+
+    public bool OceanAbortRequested { get; set; }
+
+    public bool OceanAbortConfirmed { get; set; }
+
+    public bool OceanWindowConsumed { get; set; }
+
+    public bool AutoRetainerDispatchAmbiguous { get; set; }
+
+    public HenchmanOwnership HenchmanOwnership { get; set; }
 }
 
 public enum RecoveryQuestDisposition

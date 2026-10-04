@@ -45,6 +45,14 @@ public sealed class MonitoringStatus
 
     public bool YesAlreadyLeaseAcquired { get; internal set; }
 
+    public RecoveryAction RecoveryAction { get; internal set; }
+
+    public RecoveryFailureCode? RecoveryFailureCode { get; internal set; }
+
+    public int RecoveryAttemptCount { get; internal set; }
+
+    public DateTime? RecoveryNextAttemptUtc { get; internal set; }
+
     public HandoffKind? ActiveHandoffKind { get; internal set; }
 
     public HandoffLeg? CurrentHandoffLeg { get; internal set; }
@@ -159,6 +167,7 @@ public static class MonitoringStatusFormatter
                $"Lifestream={FormatAvailability(status.LifestreamAvailable)}; " +
                $"Henchman={FormatAvailability(status.HenchmanAvailable)}; HenchmanBusy={status.HenchmanBusy}; " +
                $"YesAlreadyLease={status.YesAlreadyLeaseAcquired}; " +
+               $"RecoveryAction={status.RecoveryAction}; RecoveryFailure={status.RecoveryFailureCode?.ToString() ?? "none"}; RecoveryAttempt={status.RecoveryAttemptCount}; RecoveryNextAttempt={status.RecoveryNextAttemptUtc?.ToString("O") ?? "none"}; " +
                $"HandoffKind={(status.ActiveHandoffKind?.ToString() ?? "none")}; " +
                $"HandoffLeg={(status.CurrentHandoffLeg?.ToString() ?? "none")}; OceanLegResolved={status.OceanLegResolved}; AutoRetainerLegResolved={status.AutoRetainerLegResolved}; PendingAutoRetainerMode={(status.PendingAutoRetainerMode?.ToString() ?? "none")}; " +
                $"NextOcean={status.NextOceanWindowUtc?.ToString("O") ?? "none"}; OceanEligible={status.OceanLaunchEligible}; OceanHandled={status.OceanWindowHandled}; " +
@@ -229,7 +238,9 @@ public static class MonitoringStatusFormatter
             HandoffPhase.WaitingForOceanCleanup => "Waiting for Ocean Fishing cleanup",
             HandoffPhase.WaitingForHenchmanStop => "Stopping Henchman",
             HandoffPhase.CheckingChainedWork => "Checking chained work",
+            HandoffPhase.RecoveringHandoff => "Automatic recovery",
             HandoffPhase.Error => "Error",
+            HandoffPhase.ManualIntervention => "Manual intervention required",
             _ => phase.ToString(),
         };
 

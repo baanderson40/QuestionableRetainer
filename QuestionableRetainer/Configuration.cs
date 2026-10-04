@@ -6,7 +6,7 @@ namespace QuestionableRetainer;
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
 
     public bool Enabled { get; set; }
 
@@ -25,4 +25,6 @@ public sealed class Configuration : IPluginConfiguration
     public bool ToastNotifications { get; set; } = true;
 
     public HandoffSession? ActiveSession { get; set; }
+
+    public string ManualRecoveryMessage { get; set; } = string.Empty;
 }
