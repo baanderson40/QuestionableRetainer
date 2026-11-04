@@ -14,6 +14,7 @@ public sealed class QuestionableClient
     private readonly ICallGateSubscriber<string, bool> isQuestComplete;
     private readonly ICallGateSubscriber<string, bool> startQuest;
     private readonly IPluginLog log;
+    private readonly IpcAvailabilityLog availability;
 
     public QuestionableClient(IDalamudPluginInterface pluginInterface, IPluginLog log)
     {
@@ -22,6 +23,7 @@ public sealed class QuestionableClient
         isQuestComplete = pluginInterface.GetIpcSubscriber<string, bool>("Questionable.IsQuestComplete");
         startQuest = pluginInterface.GetIpcSubscriber<string, bool>("Questionable.StartQuest");
         this.log = log;
+        availability = new IpcAvailabilityLog(log);
     }
 
     public bool TryIsRunning(out bool running)
@@ -29,11 +31,12 @@ public sealed class QuestionableClient
         try
         {
             running = isRunning.InvokeFunc();
+            availability.Succeeded("Questionable.IsRunning");
             return true;
         }
         catch (Exception ex)
         {
-            log.Debug(ex, "Questionable IPC is unavailable.");
+            availability.Failed("Questionable.IsRunning", ex);
             running = false;
             return false;
         }
@@ -44,12 +47,13 @@ public sealed class QuestionableClient
         try
         {
             questId = getCurrentQuestId.InvokeFunc() ?? string.Empty;
+            availability.Succeeded("Questionable.GetCurrentQuestId");
             available = true;
             return !string.IsNullOrWhiteSpace(questId);
         }
         catch (Exception ex)
         {
-            log.Debug(ex, "Questionable quest IPC is unavailable.");
+            availability.Failed("Questionable.GetCurrentQuestId", ex);
             questId = string.Empty;
             available = false;
             return false;
@@ -142,12 +146,13 @@ public sealed class QuestionableClient
         try
         {
             complete = isQuestComplete.InvokeFunc(questId);
+            availability.Succeeded("Questionable.IsQuestComplete");
             available = true;
             return true;
         }
         catch (Exception ex)
         {
-            log.Debug(ex, "Questionable completion IPC is unavailable for quest {QuestId}.", questId);
+            availability.Failed("Questionable.IsQuestComplete", ex);
             complete = false;
             available = false;
             return false;

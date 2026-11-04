@@ -6,7 +6,7 @@ namespace QuestionableRetainer;
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 3;
+    public int Version { get; set; } = 4;
 
     public bool Enabled { get; set; }
 
@@ -17,6 +17,14 @@ public sealed class Configuration : IPluginConfiguration
     public bool MonitorOceanFishing { get; set; }
 
     public int OceanFishingLeadMinutes { get; set; } = 5;
+
+    public OceanFishingCharacterMode OceanFishingCharacterMode { get; set; }
+
+    public ulong OceanFishingCharacterContentId { get; set; }
+
+    public string OceanFishingCharacterName { get; set; } = string.Empty;
+
+    public string OceanFishingCharacterWorld { get; set; } = string.Empty;
 
     public DateTime? LastHandledOceanFishingWindowUtc { get; set; }
 

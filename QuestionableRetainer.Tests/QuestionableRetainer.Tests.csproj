@@ -12,9 +12,14 @@
         <Compile Include="..\QuestionableRetainer\Automation\ChainedWorkPlanner.cs" Link="Automation\ChainedWorkPlanner.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\OceanFishingSchedule.cs" Link="Automation\OceanFishingSchedule.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\OceanFishingCleanupPolicy.cs" Link="Automation\OceanFishingCleanupPolicy.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\OceanFishingPolicy.cs" Link="Automation\OceanFishingPolicy.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\WahToolsFeeshStatus.cs" Link="Automation\WahToolsFeeshStatus.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\WahToolsFeeshStatusPolicy.cs" Link="Automation\WahToolsFeeshStatusPolicy.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\OceanCleanupConfirmationPolicy.cs" Link="Automation\OceanCleanupConfirmationPolicy.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\QuestionableStopPolicy.cs" Link="Automation\QuestionableStopPolicy.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\MonitoringStatus.cs" Link="Automation\MonitoringStatus.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\ReadinessEvaluator.cs" Link="Automation\ReadinessEvaluator.cs" />
         <Compile Include="..\QuestionableRetainer\Automation\RecoveryPolicy.cs" Link="Automation\RecoveryPolicy.cs" />
+        <Compile Include="..\QuestionableRetainer\Automation\StartupRecoveryPolicy.cs" Link="Automation\StartupRecoveryPolicy.cs" />
     </ItemGroup>
 </Project>

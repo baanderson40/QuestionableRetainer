@@ -16,7 +16,7 @@
 - `QuestionableRetainer/Plugin.cs` is the entrypoint, composition root, and command boundary (`/questionableretainer`, `/qr`).
 - `Automation/HandoffController.cs` owns the framework-tick state machine.
 - Keep pure policy logic in `Automation/`; the test executable links selected policy sources directly rather than referencing the plugin project.
-- `Integrations/` owns IPC/reflection boundaries for AutoRetainer, Questionable, Lifestream, Henchman, and YesAlready.
+- `Integrations/` owns IPC/reflection boundaries for AutoRetainer, Questionable, Lifestream, WahTools Feesh, and YesAlready.
 - `Windows/ConfigurationWindow.cs` owns ImGui configuration; `Configuration.cs` persists monitoring and recovery state through Dalamud.
 
-Runtime requires AutoRetainer, Questionable Automatic mode, and Lifestream. Ocean Fishing additionally requires Henchman, AutoHook, and vnavmesh. Handoff logic must stay on the Dalamud framework thread and use UTC timing. Persisted recovery must not automatically restart Questionable after reload; changes to Questionable reflection boundaries require live integration validation.
+Runtime requires AutoRetainer, Questionable Automatic mode, and Lifestream. Ocean Fishing additionally requires WahTools Feesh IPCs. Handoff logic must stay on the Dalamud framework thread and use UTC timing. Persisted recovery must not automatically restart Questionable after reload; changes to Questionable reflection boundaries require live integration validation.

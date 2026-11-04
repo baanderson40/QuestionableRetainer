@@ -10,12 +10,14 @@ public sealed class LifestreamClient
     private readonly ICallGateSubscriber<bool> isBusy;
     private readonly ICallGateSubscriber<string, string, ErrorCode> changeCharacter;
     private readonly IPluginLog log;
+    private readonly IpcAvailabilityLog availability;
 
     public LifestreamClient(IDalamudPluginInterface pluginInterface, IPluginLog log)
     {
         isBusy = pluginInterface.GetIpcSubscriber<bool>("Lifestream.IsBusy");
         changeCharacter = pluginInterface.GetIpcSubscriber<string, string, ErrorCode>("Lifestream.ChangeCharacter");
         this.log = log;
+        availability = new IpcAvailabilityLog(log);
     }
 
     public bool TryIsBusy(out bool busy)
@@ -23,11 +25,12 @@ public sealed class LifestreamClient
         try
         {
             busy = isBusy.InvokeFunc();
+            availability.Succeeded("Lifestream.IsBusy");
             return true;
         }
         catch (Exception ex)
         {
-            log.Debug(ex, "Lifestream IPC is unavailable.");
+            availability.Failed("Lifestream.IsBusy", ex);
             busy = false;
             return false;
         }
@@ -39,10 +42,14 @@ public sealed class LifestreamClient
         {
             var result = changeCharacter.InvokeFunc(name, world);
             error = result == ErrorCode.Success ? string.Empty : result.ToString();
-            log.Information(
-                "Lifestream return IPC invoked. Target=original-character Result={Result} Accepted={Accepted}.",
-                result,
-                result == ErrorCode.Success);
+            if (result == ErrorCode.Success)
+                log.Information("Lifestream character-change IPC accepted. Target={Target}@{World}.", name, world);
+            else
+                log.Verbose(
+                    "Lifestream character-change IPC rejected. Target={Target}@{World} Result={Result}.",
+                    name,
+                    world,
+                    result);
             return result == ErrorCode.Success;
         }
         catch (Exception ex)

@@ -19,6 +19,7 @@ public sealed class AutoRetainerClient : IDisposable
     private readonly ICallGateSubscriber<MultiModeType?, object> enableSingleMultiMode;
     private readonly ICallGateSubscriber<object> singleMultiModeFinished;
     private readonly IPluginLog log;
+    private readonly IpcAvailabilityLog availability;
 
     public AutoRetainerClient(IDalamudPluginInterface pluginInterface, IPluginLog log)
     {
@@ -33,6 +34,7 @@ public sealed class AutoRetainerClient : IDisposable
         enableSingleMultiMode = pluginInterface.GetIpcSubscriber<MultiModeType?, object>("AutoRetainer.PluginState.EnableSingleMultiMode");
         singleMultiModeFinished = pluginInterface.GetIpcSubscriber<object>("AutoRetainer.PluginState.OnSingleMultiModeFinished");
         this.log = log;
+        availability = new IpcAvailabilityLog(log);
         singleMultiModeFinished.Subscribe(OnSingleMultiModeFinished);
     }
 
@@ -49,11 +51,12 @@ public sealed class AutoRetainerClient : IDisposable
         {
             busy = isBusy.InvokeFunc();
             multiModeActive = getMultiModeStatus.InvokeFunc();
+            availability.Succeeded("AutoRetainer state");
             return true;
         }
         catch (Exception ex)
         {
-            log.Debug(ex, "AutoRetainer state IPC is unavailable.");
+            availability.Failed("AutoRetainer state", ex);
             busy = false;
             multiModeActive = false;
             return false;
@@ -71,6 +74,27 @@ public sealed class AutoRetainerClient : IDisposable
         {
             log.Debug(ex, "Could not read AutoRetainer character {ContentId}.", contentId);
             character = null!;
+            return false;
+        }
+    }
+
+    public bool TryGetRegisteredCharacters(out IReadOnlyList<OfflineCharacterData> characters)
+    {
+        try
+        {
+            characters = getRegisteredCharacters.InvokeFunc()
+                .Select(contentId => getCharacterData.InvokeFunc(contentId))
+                .Where(character => character is not null)
+                .Cast<OfflineCharacterData>()
+                .OrderBy(character => character.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(character => character.World, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log.Debug(ex, "Could not read registered AutoRetainer characters.");
+            characters = [];
             return false;
         }
     }

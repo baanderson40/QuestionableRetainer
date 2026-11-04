@@ -14,18 +14,16 @@ public sealed class HandoffController : IDisposable
     private static readonly TimeSpan ActionRetryInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan QuestionableStopRetryInterval = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan MonitoringHeartbeatInterval = TimeSpan.FromMinutes(1);
-    private static readonly TimeSpan HenchmanStartTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan OceanDutyStartTimeout = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan OceanVoyageTimeout = TimeSpan.FromHours(2);
-    private static readonly TimeSpan OceanCleanupStableDuration = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan HenchmanStopTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan OceanCleanupPollInterval = TimeSpan.FromSeconds(1);
     private const float OceanPositionTolerance = 0.1f;
     private const uint OceanFishingTerritoryOne = 900;
     private const uint OceanFishingTerritoryTwo = 1163;
     private readonly Configuration configuration;
     private readonly AutoRetainerClient autoRetainer;
-    private readonly HenchmanClient henchman;
+    private readonly WahToolsFeeshClient wahToolsFeesh;
+    private readonly WahToolsFeeshStatusReader wahToolsStatusReader;
     private readonly YesAlreadyLease yesAlreadyLease;
     private readonly QuestionableClient questionable;
     private readonly LifestreamClient lifestream;
@@ -41,6 +39,7 @@ public sealed class HandoffController : IDisposable
     private readonly IPluginLog log;
     private readonly Action save;
     private readonly MonitoringStatus monitoring = new();
+    private readonly VerboseDiagnosticLog diagnosticLog;
     private DateTime nextUpdateUtc;
     private DateTime phaseStartedUtc;
     private DateTime lastActionUtc;
@@ -50,22 +49,31 @@ public sealed class HandoffController : IDisposable
     private Vector3? oceanCleanupStablePosition;
     private uint oceanCleanupStableTerritory;
     private ulong oceanCleanupStableContentId;
+    private long? oceanCleanupConfirmationGeneration;
     private DateTime nextOceanCleanupPollUtc;
     private MonitoringState lastLoggedMonitoringState;
     private string lastLoggedMonitoringReason = string.Empty;
     private DateTime lastMonitoringLogUtc;
+    private DateTime nextFishingCharacterListRefreshUtc;
+    private DateTime nextWahToolsStatusRefreshUtc;
+    private IReadOnlyList<OfflineCharacterData> fishingCharacterCache = [];
+    private bool fishingCharacterListAvailable;
     private bool completionEventReceived;
     private bool autoRetainerMultiModeObserved;
     private bool recoveryPending;
     private bool questionablePausedThisRuntime;
     private bool manualResumeAuthorized;
     private bool offFrameworkUpdateLogged;
-    private bool henchmanOwnedThisRuntime;
+    private bool wahToolsSessionObservedThisRuntime;
+    private readonly RecoveryDependencyWaitClock dependencyWaitClock = new();
+    private bool evaluatingStartupRecovery;
+    private string? activeDependencyGateFingerprint;
 
     public HandoffController(
         Configuration configuration,
         AutoRetainerClient autoRetainer,
-        HenchmanClient henchman,
+        WahToolsFeeshClient wahToolsFeesh,
+        WahToolsFeeshStatusReader wahToolsStatusReader,
         YesAlreadyLease yesAlreadyLease,
         QuestionableClient questionable,
         LifestreamClient lifestream,
@@ -83,7 +91,8 @@ public sealed class HandoffController : IDisposable
     {
         this.configuration = configuration;
         this.autoRetainer = autoRetainer;
-        this.henchman = henchman;
+        this.wahToolsFeesh = wahToolsFeesh;
+        this.wahToolsStatusReader = wahToolsStatusReader;
         this.yesAlreadyLease = yesAlreadyLease;
         this.questionable = questionable;
         this.lifestream = lifestream;
@@ -97,6 +106,7 @@ public sealed class HandoffController : IDisposable
         this.notificationManager = notificationManager;
         this.framework = framework;
         this.log = log;
+        diagnosticLog = new VerboseDiagnosticLog(log);
         this.save = save;
         autoRetainer.SingleMultiModeFinished += OnSingleMultiModeFinished;
         dutyState.DutyStarted += OnDutyStarted;
@@ -133,6 +143,19 @@ public sealed class HandoffController : IDisposable
 
     public MonitoringStatus Monitoring => monitoring;
 
+    public bool TryGetFishingCharacters(out IReadOnlyList<OfflineCharacterData> characters)
+    {
+        var now = DateTime.UtcNow;
+        if (now >= nextFishingCharacterListRefreshUtc)
+        {
+            fishingCharacterListAvailable = autoRetainer.TryGetRegisteredCharacters(out fishingCharacterCache);
+            nextFishingCharacterListRefreshUtc = now + TimeSpan.FromSeconds(15);
+        }
+
+        characters = fishingCharacterCache;
+        return fishingCharacterListAvailable;
+    }
+
     public void Dispose()
     {
         autoRetainer.SingleMultiModeFinished -= OnSingleMultiModeFinished;
@@ -165,9 +188,28 @@ public sealed class HandoffController : IDisposable
 
         if (recoveryPending)
         {
-            TryInitializeRecovery();
+            evaluatingStartupRecovery = true;
+            try
+            {
+                TryInitializeRecovery();
+            }
+            finally
+            {
+                evaluatingStartupRecovery = false;
+            }
+            if (!recoveryPending)
+            {
+                // A recovered phase gets a fresh runtime budget, even when its name is unchanged.
+                phaseStartedUtc = DateTime.UtcNow;
+                dependencyWaitClock.Reset();
+            }
             return;
         }
+
+        RefreshWahToolsStatus(now);
+
+        if (!CanAdvanceWithDependencies(now))
+            return;
 
         switch (Phase)
         {
@@ -177,8 +219,14 @@ public sealed class HandoffController : IDisposable
             case HandoffPhase.WaitingForQuestionable:
                 UpdateWaitingForQuestionable(now);
                 break;
-            case HandoffPhase.WaitingForHenchmanStart:
-                UpdateWaitingForHenchmanStart(now);
+            case HandoffPhase.PreparingFishingCharacter:
+                PrepareFishingCharacter(now);
+                break;
+            case HandoffPhase.WaitingForFishingCharacter:
+                UpdateWaitingForFishingCharacter(now);
+                break;
+            case HandoffPhase.StartingWahToolsFishing:
+                StartWahToolsFishing(now);
                 break;
             case HandoffPhase.WaitingForOceanDuty:
                 UpdateWaitingForOceanDuty(now);
@@ -186,8 +234,8 @@ public sealed class HandoffController : IDisposable
             case HandoffPhase.WaitingForOceanCleanup:
                 UpdateWaitingForOceanCleanup(now);
                 break;
-            case HandoffPhase.WaitingForHenchmanStop:
-                UpdateWaitingForHenchmanStop(now);
+            case HandoffPhase.WaitingForWahToolsStop:
+                UpdateWaitingForWahToolsStop(now);
                 break;
             case HandoffPhase.CheckingChainedWork:
                 UpdateCheckingChainedWork(now);
@@ -227,6 +275,128 @@ public sealed class HandoffController : IDisposable
 
     public void Recover() => DispatchToFrameworkThread(RecoverCore, nameof(Recover));
 
+    public void ConfirmFeeshStopped() => DispatchToFrameworkThread(ConfirmFeeshStoppedCore, nameof(ConfirmFeeshStopped));
+
+    public void ResetPluginState() => DispatchToFrameworkThread(ResetPluginStateCore, nameof(ResetPluginState));
+
+    private void ResetPluginStateCore()
+    {
+        var session = configuration.ActiveSession;
+        log.Warning(
+            "Questionable Retainer plugin state manually reset. Session={Session} Phase={Phase} Original={Original}@{World} Fishing={Fishing}@{FishingWorld} Reason={Reason}.",
+            session?.CorrelationId ?? "none",
+            Phase,
+            session?.OriginalName ?? "none",
+            session?.OriginalWorld ?? "none",
+            session?.FishingName ?? "none",
+            session?.FishingWorld ?? "none",
+            !string.IsNullOrWhiteSpace(session?.RecoveryMessage)
+                ? session.RecoveryMessage
+                : !string.IsNullOrWhiteSpace(session?.LastError)
+                    ? session.LastError
+                    : monitoring.Reason);
+
+        configuration.Enabled = false;
+        if (session?.OceanWindowStartUtc is { } windowStart)
+            configuration.LastHandledOceanFishingWindowUtc = windowStart;
+        configuration.ActiveSession = null;
+        configuration.ManualRecoveryMessage = string.Empty;
+        diagnosticLog.Reset();
+        yesAlreadyLease.Release();
+
+        recoveryPending = false;
+        questionablePausedThisRuntime = false;
+        manualResumeAuthorized = false;
+        completionEventReceived = false;
+        autoRetainerMultiModeObserved = false;
+        wahToolsSessionObservedThisRuntime = false;
+        wahToolsStatusReader.Invalidate();
+        nextWahToolsStatusRefreshUtc = DateTime.MinValue;
+        lastActionUtc = DateTime.MinValue;
+        fishingCharacterCache = [];
+        fishingCharacterListAvailable = false;
+        nextFishingCharacterListRefreshUtc = DateTime.MinValue;
+        nextQuestionableStopRetryUtc = DateTime.MinValue;
+        lastDependencyRefreshUtc = DateTime.MinValue;
+        nextUpdateUtc = DateTime.MinValue;
+        ResetOceanCleanupStability();
+        ResetReadinessDiagnostics();
+
+        monitoring.QuestionableAvailable = null;
+        monitoring.QuestionableRunning = null;
+        monitoring.QuestionableQuestId = string.Empty;
+        monitoring.AutoRetainerAvailable = null;
+        monitoring.AutoRetainerBusy = false;
+        monitoring.AutoRetainerMultiModeActive = false;
+        monitoring.ReadinessScanAvailable = null;
+        monitoring.LifestreamAvailable = null;
+        monitoring.LifestreamBusy = false;
+        monitoring.WahToolsAvailable = null;
+        monitoring.WahToolsLaunchAccepted = false;
+        monitoring.WahToolsStatus = null;
+        monitoring.WahToolsStatusEvaluationUtc = null;
+        monitoring.WahToolsStatusAgeSeconds = null;
+        monitoring.YesAlreadyLeaseAcquired = false;
+        monitoring.NextOceanWindowUtc = null;
+        monitoring.OceanLaunchEligible = false;
+        monitoring.OceanWindowHandled = session?.OceanWindowStartUtc is not null;
+        monitoring.OceanDutyStarted = false;
+        monitoring.OceanDutyCompleted = false;
+        monitoring.OceanCleanupWaitReason = string.Empty;
+        monitoring.OceanCleanupStableElapsedSeconds = null;
+        monitoring.OceanCleanupRequiredSeconds = null;
+        monitoring.OceanCleanupConfirmationSource = OceanCleanupConfirmationSource.None;
+        monitoring.CurrentContentId = null;
+        monitoring.FishingCharacterContentId = null;
+        monitoring.LastDependencyCheckUtc = null;
+        monitoring.PlayerLoggedIn = false;
+        monitoring.PlayerContentIdAvailable = false;
+        monitoring.PlayerBlockers = [];
+
+        SetPhase(HandoffPhase.Idle, persist: false);
+        SetMonitoring(MonitoringState.Disabled, "Plugin state reset; monitoring disabled.", DateTime.UtcNow);
+        lastLoggedMonitoringState = MonitoringState.Disabled;
+        lastLoggedMonitoringReason = "Plugin state reset; monitoring disabled.";
+        lastMonitoringLogUtc = DateTime.UtcNow;
+        save();
+        Notify("Plugin state reset. Monitoring is disabled; other plugin automation was left untouched.", NotificationType.Warning);
+    }
+
+    private void ConfirmFeeshStoppedCore()
+    {
+        if (Phase != HandoffPhase.ManualIntervention ||
+            configuration.ActiveSession is not { OceanWindowStartUtc: not null } session)
+            return;
+
+        if (IsOceanFishingDutyActive() || IsOceanFishingTerritory() ||
+            !TryGetAutoRetainerState(out var autoBusy, out var multiModeActive) || autoBusy || multiModeActive ||
+            !TryGetLifestreamBusy(out var lifestreamBusy) || lifestreamBusy ||
+            (monitoring.WahToolsStatus is { IsAvailable: true } feeshStatus &&
+             WahToolsFeeshStatusPolicy.GetCleanupBlockers(feeshStatus).Count > 0) ||
+            (clientState.IsLoggedIn && !IsSafeForHandoff()))
+        {
+            Notify("Cannot continue while Ocean Fishing, AutoRetainer, Lifestream, or player activity remains active.", NotificationType.Warning);
+            return;
+        }
+
+        session.WahToolsLaunchAccepted = false;
+        session.WahToolsLaunchAmbiguous = false;
+        session.WahToolsStopRequested = true;
+        session.WahToolsStopRequestedUtc ??= DateTime.UtcNow;
+        session.WahToolsStopAcceptedUtc = DateTime.UtcNow;
+        session.OceanFishingLegSkipped = true;
+        session.CurrentLeg = HandoffLeg.None;
+        session.RecoveryAction = RecoveryAction.None;
+        session.RecoveryMessage = string.Empty;
+        session.LastError = string.Empty;
+        session.RecoveryFailureCode = null;
+        if (session.OceanWindowStartUtc is { } windowStart)
+            configuration.LastHandledOceanFishingWindowUtc = windowStart;
+        save();
+        SetPhase(HandoffPhase.ReturningOriginal, reason: "Feesh stop was manually confirmed; returning to original character.");
+        Notify("Feesh stop confirmed. Returning to original character.");
+    }
+
     private void RecoverCore()
     {
         if (configuration.ActiveSession is null)
@@ -249,7 +419,24 @@ public sealed class HandoffController : IDisposable
         configuration.ActiveSession.RecoveryNextAttemptUtc = DateTime.UtcNow;
         recoveryPending = false;
         if (Phase is HandoffPhase.Error or HandoffPhase.ManualIntervention)
-            SetPhase(HandoffPhase.RecoveringHandoff, reason: "Manual retry requested.");
+        {
+            var session = configuration.ActiveSession;
+            if (session.RecoveryAction == RecoveryAction.ManualIntervention)
+            {
+                if (session.RecoveryOriginPhase is HandoffPhase.Idle or HandoffPhase.Error or
+                    HandoffPhase.ManualIntervention or HandoffPhase.RecoveringHandoff)
+                {
+                    Notify("Recovery has no safe retry origin. Confirm Feesh stopped or reset QR state.", NotificationType.Warning);
+                    return;
+                }
+
+                session.RecoveryAction = RecoveryAction.None;
+                SetPhase(session.RecoveryOriginPhase, reason: "Manual retry requested; reconciling saved evidence without redispatch.");
+                recoveryPending = true;
+            }
+            else
+                SetPhase(HandoffPhase.RecoveringHandoff, reason: "Manual retry requested.");
+        }
         nextUpdateUtc = DateTime.MinValue;
         save();
         log.Information("Recovery retry requested. Session={Session} Phase={Phase}.", SessionId(), Phase);
@@ -286,7 +473,7 @@ public sealed class HandoffController : IDisposable
         if (configuration.ActiveSession is not { } session ||
             !TryGetAutoRetainerState(out var busy, out var multiModeActive) || busy || multiModeActive ||
             !TryGetLifestreamBusy(out var lifestreamBusy) || lifestreamBusy ||
-            (IsOceanLeg(session) && (!henchman.TryGetState(out var henchmanBusy) || henchmanBusy)) ||
+            (IsOceanFishingDutyActive() || IsOceanFishingTerritory()) ||
             !clientState.IsLoggedIn || playerState.ContentId != session.OriginalContentId ||
             CapturePlayerBlockers().Count > 0)
         {
@@ -365,6 +552,9 @@ public sealed class HandoffController : IDisposable
 
         monitoring.ReadinessScanAvailable = readinessAvailable ? true : autoRetainerAvailable ? false : null;
         var hasReadyWork = monitoring.ReadyCharacterCount > 0;
+        var readinessFingerprint = $"{SessionId()}|available={readinessAvailable};registered={monitoring.RegisteredCharacterCount};ready={monitoring.ReadyCharacterCount};closest={monitoring.ClosestRetainerSeconds?.ToString() ?? "none"};retainers={configuration.MonitorRetainers};deployables={configuration.MonitorDeployables}";
+        diagnosticLog.Write("readiness", readinessFingerprint,
+            $"ReadinessScanCompleted Session={SessionId()} Available={readinessAvailable} Registered={monitoring.RegisteredCharacterCount} Ready={monitoring.ReadyCharacterCount} ClosestRetainerSeconds={monitoring.ClosestRetainerSeconds?.ToString() ?? "none"} Retainers={configuration.MonitorRetainers} Deployables={configuration.MonitorDeployables} EvidenceUtc={monitoring.LastReadinessScanUtc?.ToString("O") ?? "none"}.", now);
 
         if (playerBlockers.Count > 0)
         {
@@ -486,7 +676,7 @@ public sealed class HandoffController : IDisposable
 
         var session = new HandoffSession
         {
-            SessionVersion = 5,
+            SessionVersion = 8,
             Kind = HandoffKind.AutoRetainer,
             CurrentLeg = HandoffLeg.AutoRetainer,
             PendingAutoRetainerMode = GetConfiguredAutoRetainerMode(),
@@ -499,6 +689,7 @@ public sealed class HandoffController : IDisposable
             QuestionableWasRunning = questionableRunning,
         };
         ResetOceanCleanupStability();
+        diagnosticLog.Reset();
         configuration.ActiveSession = session;
         save();
 
@@ -534,18 +725,6 @@ public sealed class HandoffController : IDisposable
             return;
         }
 
-        if (monitoring.HenchmanAvailable != true)
-        {
-            SetMonitoring(MonitoringState.ReadyWorkBlocked, "Ocean Fishing ready; Henchman IPC is unavailable.", now);
-            return;
-        }
-
-        if (monitoring.HenchmanBusy)
-        {
-            SetMonitoring(MonitoringState.ReadyWorkBlocked, "Ocean Fishing ready; an existing Henchman task will not be preempted.", now);
-            return;
-        }
-
         if (monitoring.PlayerBlockers.Count > 0)
         {
             SetMonitoring(
@@ -566,7 +745,7 @@ public sealed class HandoffController : IDisposable
 
         var session = new HandoffSession
         {
-            SessionVersion = 5,
+            SessionVersion = 8,
             Kind = HandoffKind.OceanFishing,
             CurrentLeg = HandoffLeg.OceanFishing,
             CorrelationId = CreateCorrelationId(),
@@ -578,7 +757,13 @@ public sealed class HandoffController : IDisposable
             QuestionableWasRunning = true,
             OceanWindowStartUtc = oceanState.Window.StartUtc,
         };
+        if (!TrySelectFishingCharacter(session, out var selectionError))
+        {
+            SetMonitoring(MonitoringState.ReadyWorkBlocked, selectionError, now);
+            return;
+        }
         ResetOceanCleanupStability();
+        diagnosticLog.Reset();
         configuration.ActiveSession = session;
         save();
 
@@ -666,7 +851,8 @@ public sealed class HandoffController : IDisposable
         if (IsOceanLeg(session))
         {
             save();
-            StartHenchman(session);
+            SetPhase(HandoffPhase.PreparingFishingCharacter, reason: "Questionable paused; preparing selected Ocean Fishing character.");
+            PrepareFishingCharacter(now);
             return;
         }
 
@@ -683,8 +869,165 @@ public sealed class HandoffController : IDisposable
         SetPhase(HandoffPhase.WaitingForAutoRetainerIdle);
     }
 
-    private void StartHenchman(HandoffSession session)
+    private bool TrySelectFishingCharacter(HandoffSession session, out string error)
     {
+        OfflineCharacterData? selectedCharacter = null;
+        if (configuration.OceanFishingCharacterMode == OceanFishingCharacterMode.SelectedCharacter &&
+            configuration.OceanFishingCharacterContentId != 0)
+            autoRetainer.TryGetCharacter(configuration.OceanFishingCharacterContentId, out selectedCharacter!);
+
+        var current = new OceanFishingCharacterIdentity(session.OriginalContentId, session.OriginalName, session.OriginalWorld);
+        OceanFishingCharacterIdentity? selected = selectedCharacter is null
+                                                      ? null
+                                                      : new(selectedCharacter.CID, selectedCharacter.Name, selectedCharacter.World);
+        if (!OceanFishingPolicy.TrySelectCharacter(configuration.OceanFishingCharacterMode, current, selected, out var target))
+        {
+            error = "Selected Ocean Fishing character is no longer available in AutoRetainer; update selection before the next window.";
+            return false;
+        }
+
+        session.FishingContentId = target.ContentId;
+        session.FishingName = target.Name;
+        session.FishingWorld = target.World;
+        error = string.Empty;
+        return true;
+    }
+
+    private void PrepareFishingCharacter(DateTime now)
+    {
+        var session = configuration.ActiveSession;
+        if (session is null || !IsOceanLeg(session))
+        {
+            Fail("Ocean Fishing handoff data is missing before character selection.");
+            return;
+        }
+
+        if (!TryGetAutoRetainerState(out var autoBusy, out var multiModeActive) || autoBusy || multiModeActive)
+        {
+            Wait(now, "Waiting for AutoRetainer to become idle before fishing-character selection.");
+            return;
+        }
+
+        if (!TryGetLifestreamBusy(out var lifestreamBusy) || lifestreamBusy)
+        {
+            Wait(now, "Waiting for Lifestream to become idle before fishing-character selection.");
+            return;
+        }
+
+        if (clientState.IsLoggedIn && playerState.ContentId == session.FishingContentId)
+        {
+            if (IsSafeForHandoff())
+                SetPhase(HandoffPhase.StartingWahToolsFishing, reason: "Fishing character confirmed; preparing WahTools voyage.");
+            else
+                Wait(now, $"Waiting for fishing character safe state; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(CapturePlayerBlockers())}.");
+            return;
+        }
+
+        if (HasTimedOut(now, TimeSpan.FromMinutes(10)))
+        {
+            Fail("Fishing character login did not complete within ten minutes.");
+            return;
+        }
+
+        if (now < lastActionUtc + ActionRetryInterval)
+        {
+            Wait(now, "Waiting before requesting fishing-character login.");
+            return;
+        }
+
+        if (session.NextFishingCharacterSwitchAttemptUtc is { } nextSwitch && now < nextSwitch)
+        {
+            Wait(now, "Waiting before retrying fishing-character login.");
+            return;
+        }
+
+        lastActionUtc = now;
+        if (!lifestream.TryChangeCharacter(session.FishingName, session.FishingWorld, out var error))
+        {
+            session.FishingCharacterSwitchAttempts++;
+            session.NextFishingCharacterSwitchAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.FishingCharacterSwitchAttempts);
+            save();
+            diagnosticLog.Write("character-switch-retry", $"fishing|{session.FishingCharacterSwitchAttempts}|{error}",
+                $"CharacterSwitchRetry Session={SessionId()} Phase={Phase} Operation=FishingCharacter Target={session.FishingName}@{session.FishingWorld} TargetContentId={session.FishingContentId} Attempt={session.FishingCharacterSwitchAttempts} Result=Rejected Error={error} NextAttemptUtc={session.NextFishingCharacterSwitchAttemptUtc:O}.", now);
+            Wait(now, $"Lifestream fishing-character request rejected: {error}.");
+            return;
+        }
+
+        session.NextFishingCharacterSwitchAttemptUtc = null;
+        save();
+        SetPhase(HandoffPhase.WaitingForFishingCharacter, reason: $"Logging into fishing character {session.FishingName}@{session.FishingWorld}.");
+    }
+
+    private void UpdateWaitingForFishingCharacter(DateTime now)
+    {
+        var session = configuration.ActiveSession;
+        if (session is null || !IsOceanLeg(session))
+        {
+            Fail("Ocean Fishing session is missing while waiting for fishing character.");
+            return;
+        }
+
+        if (HasTimedOut(now, TimeSpan.FromMinutes(10)))
+        {
+            Fail("Fishing character login did not complete within ten minutes.");
+            return;
+        }
+
+        if (clientState.IsLoggedIn && playerState.ContentId == session.FishingContentId)
+        {
+            if (IsSafeForHandoff())
+                SetPhase(HandoffPhase.StartingWahToolsFishing, reason: "Fishing character confirmed; preparing WahTools voyage.");
+            else
+                Wait(now, $"Waiting for fishing character safe state; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(CapturePlayerBlockers())}.");
+            return;
+        }
+
+        Wait(now, "Waiting for Lifestream to finish logging into the fishing character.");
+    }
+
+    private void StartWahToolsFishing(DateTime now)
+    {
+        var session = configuration.ActiveSession;
+        if (session is null || !IsOceanLeg(session))
+        {
+            Fail("Ocean Fishing handoff data is missing before WahTools dispatch.");
+            return;
+        }
+
+        if (!clientState.IsLoggedIn || playerState.ContentId != session.FishingContentId)
+        {
+            SetPhase(HandoffPhase.PreparingFishingCharacter, reason: "Fishing character changed before dispatch; confirming target again.");
+            return;
+        }
+
+        if (!TryGetAutoRetainerState(out var autoBusy, out var multiModeActive) || autoBusy || multiModeActive)
+        {
+            Wait(now, "Waiting for AutoRetainer to become idle before WahTools launch.");
+            return;
+        }
+
+        if (!TryGetLifestreamBusy(out var lifestreamBusy) || lifestreamBusy)
+        {
+            Wait(now, "Waiting for Lifestream to become idle before WahTools launch.");
+            return;
+        }
+
+        if (!IsSafeForHandoff())
+        {
+            Wait(now, $"Waiting for safe WahTools launch state; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(CapturePlayerBlockers())}.");
+            return;
+        }
+
+        if (!OceanFishingPolicy.CanDispatch(now, session.OceanWindowStartUtc,
+                clientState.IsLoggedIn && playerState.ContentId == session.FishingContentId,
+                playerSafe: true))
+        {
+            session.OceanFishingLegSkipped = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "Fishing-character login completed after Ocean Fishing cutoff; restoring original character.");
+            return;
+        }
+
         var leaseResult = yesAlreadyLease.TryAcquire(out var leaseError);
         if (leaseResult == YesAlreadyLeaseResult.Unavailable)
         {
@@ -695,29 +1038,36 @@ public sealed class HandoffController : IDisposable
         session.YesAlreadyLeaseRequired = leaseResult == YesAlreadyLeaseResult.Acquired;
         session.YesAlreadyLeaseAcquired = yesAlreadyLease.IsAcquired;
         save();
-
-        if (!henchman.TryGetState(out var busy))
+        var autoOcean = wahToolsFeesh.DisableAutoOcean(out var autoError);
+        monitoring.WahToolsAvailable = autoOcean != FeeshIpcResult.Unavailable;
+        if (autoOcean != FeeshIpcResult.Accepted)
         {
-            Fail("Henchman state IPC became unavailable before Ocean Fishing could start.");
+            Fail(autoError);
             return;
         }
 
-        if (busy)
-        {
-            Fail("Henchman was already busy before QR started Ocean Fishing.");
-            return;
-        }
-
-        session.HenchmanStartRequested = true;
+        session.WahToolsLaunchRequested = true;
+        session.WahToolsLaunchAmbiguous = true;
         save();
-        if (!henchman.TryStartOnABoat(out var error))
+        var result = wahToolsFeesh.CatchTheBoat(out var launchError);
+        monitoring.WahToolsAvailable = result != FeeshIpcResult.Unavailable;
+        monitoring.WahToolsLaunchAccepted = result == FeeshIpcResult.Accepted;
+        if (result == FeeshIpcResult.Refused)
         {
-            Fail(error);
+            session.WahToolsLaunchAmbiguous = false;
+            session.OceanFishingLegSkipped = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: launchError);
             return;
         }
 
-        Notify("Henchman On A Boat started. Waiting for the Ocean Fishing voyage.");
-        SetPhase(HandoffPhase.WaitingForHenchmanStart);
+        session.WahToolsLaunchAccepted = result == FeeshIpcResult.Accepted;
+        session.WahToolsLaunchAmbiguous = result == FeeshIpcResult.Unavailable;
+        wahToolsSessionObservedThisRuntime = result == FeeshIpcResult.Accepted;
+        session.OceanFishingLegSkipped = false;
+        save();
+        Notify("WahTools Ocean Fishing request sent; observing game state for boarding.");
+        SetPhase(HandoffPhase.WaitingForOceanDuty);
     }
 
     private void UpdateCheckingChainedWork(DateTime now)
@@ -726,6 +1076,16 @@ public sealed class HandoffController : IDisposable
         if (session is null)
         {
             Fail("Recovery data is missing while checking chained work.");
+            return;
+        }
+
+        if (!clientState.IsLoggedIn || playerState.ContentId == 0)
+        {
+            session.AutoRetainerLegSkipped = true;
+            session.PendingAutoRetainerMode = null;
+            session.ReturningForAutoRetainer = false;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "Optional chained work will not start while logged out; restoring the original character.");
             return;
         }
 
@@ -807,6 +1167,8 @@ public sealed class HandoffController : IDisposable
             out var readiness);
         if (!scanned)
         {
+            diagnosticLog.Write("chained-readiness", $"unavailable|{session.CurrentLeg}",
+                $"ChainedReadinessScan Session={SessionId()} Fresh=true Available=false CurrentLeg={session.CurrentLeg} EvidenceUtc={now:O}; scheduling retry.", now);
             session.ChainedReadinessScanUtc = now;
             save();
             if (HasTimedOut(now, TimeSpan.FromMinutes(1)))
@@ -831,6 +1193,8 @@ public sealed class HandoffController : IDisposable
         monitoring.LastReadinessScanUtc = now;
         ReadyCharacterCount = readiness.ReadyCharacterCount;
         save();
+        diagnosticLog.Write("chained-readiness", $"available|{readiness.RegisteredCharacterCount}|{readiness.ReadyCharacterCount}|{readiness.ClosestRetainerSeconds}",
+            $"ChainedReadinessScan Session={SessionId()} Fresh=true Available=true Registered={readiness.RegisteredCharacterCount} Ready={readiness.ReadyCharacterCount} ClosestRetainerSeconds={readiness.ClosestRetainerSeconds?.ToString() ?? "none"} EvidenceUtc={now:O} Retainers={configuration.MonitorRetainers} Deployables={configuration.MonitorDeployables}.", now);
 
         if (readiness.ReadyCharacterCount == 0)
         {
@@ -856,7 +1220,11 @@ public sealed class HandoffController : IDisposable
 
         if (!clientState.IsLoggedIn || playerState.ContentId == 0)
         {
-            Wait(now, "Waiting for the current character before starting chained AutoRetainer work.");
+            session.AutoRetainerLegSkipped = true;
+            session.PendingAutoRetainerMode = null;
+            session.ReturningForAutoRetainer = false;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "Optional chained AutoRetainer work skipped while logged out; restoring the original character.");
             return;
         }
 
@@ -920,12 +1288,6 @@ public sealed class HandoffController : IDisposable
             return false;
         }
 
-        if (monitoring.HenchmanAvailable != true || monitoring.HenchmanBusy)
-        {
-            Wait(now, "Waiting for Henchman to become idle before starting chained Ocean Fishing.");
-            return false;
-        }
-
         if (monitoring.PlayerBlockers.Count > 0)
         {
             Wait(now, $"Waiting for a safe player state before chained Ocean Fishing; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(monitoring.PlayerBlockers)}.");
@@ -934,16 +1296,25 @@ public sealed class HandoffController : IDisposable
 
         session.CurrentLeg = HandoffLeg.OceanFishing;
         session.OceanWindowStartUtc = oceanState.Window.StartUtc;
-        session.HenchmanStartRequested = false;
-        session.HenchmanStartObserved = false;
         session.OceanDutyStarted = false;
         session.OceanDutyCompleted = false;
-        session.HenchmanStopRequested = false;
-        session.HenchmanStopConfirmed = false;
+        session.OceanTerritoryEntered = false;
+        session.OceanTerritoryExited = false;
+        session.WahToolsLaunchRequested = false;
+        session.WahToolsLaunchAccepted = false;
+        session.WahToolsLaunchAmbiguous = false;
         ResetOceanCleanupStability();
         save();
         log.Information("Starting chained Ocean Fishing without resuming Questionable. Session={Session} WindowStartUtc={WindowStartUtc}.", SessionId(), oceanState.Window.StartUtc);
-        StartHenchman(session);
+        if (!TrySelectFishingCharacter(session, out var selectionError))
+        {
+            session.OceanFishingLegSkipped = true;
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: selectionError);
+            return false;
+        }
+        SetPhase(HandoffPhase.PreparingFishingCharacter, reason: "Chained Ocean Fishing selected; preparing fishing character.");
+        PrepareFishingCharacter(now);
         return true;
     }
 
@@ -955,76 +1326,6 @@ public sealed class HandoffController : IDisposable
             (false, true) => AutoRetainerPassMode.Deployables,
             _ => null,
         };
-
-    private bool MaintainYesAlreadyLease(HandoffSession session, DateTime now)
-    {
-        if (!session.YesAlreadyLeaseRequired)
-            return true;
-
-        var result = yesAlreadyLease.TryAcquire(out var error);
-        if (result == YesAlreadyLeaseResult.Acquired)
-        {
-            if (!session.YesAlreadyLeaseAcquired)
-            {
-                session.YesAlreadyLeaseAcquired = true;
-                save();
-            }
-
-            return true;
-        }
-
-        if (result == YesAlreadyLeaseResult.NotInstalled)
-        {
-            if (session.YesAlreadyLeaseAcquired)
-            {
-                session.YesAlreadyLeaseAcquired = false;
-                save();
-            }
-
-            return true;
-        }
-
-        Wait(now, error);
-        return false;
-    }
-
-    private void UpdateWaitingForHenchmanStart(DateTime now)
-    {
-        var session = configuration.ActiveSession;
-        if (session is null || !IsOceanLeg(session))
-        {
-            Fail("Ocean Fishing handoff data is missing.");
-            return;
-        }
-
-        if (HasTimedOut(now, HenchmanStartTimeout))
-        {
-            Fail("Henchman did not accept On A Boat within 30 seconds.");
-            return;
-        }
-
-        if (!MaintainYesAlreadyLease(session, now))
-            return;
-
-        if (!henchman.TryGetState(out var busy))
-        {
-            Wait(now, "Waiting for Henchman state IPC after the start request.");
-            return;
-        }
-
-        if (!busy)
-        {
-            Wait(now, "Waiting for Henchman to accept On A Boat.");
-            return;
-        }
-
-        session.HenchmanStartObserved = true;
-        henchmanOwnedThisRuntime = true;
-        session.HenchmanOwnership = HenchmanOwnership.OwnedThisRuntime;
-        save();
-        log.Information("Henchman On A Boat ownership confirmed. Session={Session}.", SessionId());
-        SetPhase(HandoffPhase.WaitingForOceanDuty);
-    }
 
     private void UpdateWaitingForOceanDuty(DateTime now)
     {
@@ -1041,15 +1342,39 @@ public sealed class HandoffController : IDisposable
             return;
         }
 
-        if (!session.OceanDutyStarted && !MaintainYesAlreadyLease(session, now))
-            return;
-
-        if (!session.OceanDutyStarted && IsOceanFishingDutyActive())
+        var observation = OceanFishingPolicy.Observe(
+            IsOceanFishingTerritory(),
+            IsOceanFishingDutyActive(),
+            session.OceanDutyCompleted,
+            session.OceanTerritoryEntered);
+        if (observation == OceanFishingObservation.TerritoryEntered)
         {
+            session.OceanTerritoryEntered = true;
+            session.OceanDutyStarted = true;
+            save();
+            log.Information("Ocean Fishing territory entry observed. Session={Session} Territory={Territory}.", SessionId(), clientState.TerritoryType);
+        }
+
+        if (observation == OceanFishingObservation.DutyActive && !session.OceanDutyStarted)
+        {
+            session.OceanTerritoryEntered = true;
             session.OceanDutyStarted = true;
             ReleaseYesAlreadyLease(session);
             save();
             log.Information("Ocean Fishing duty observed. Session={Session}.", SessionId());
+        }
+
+        if (monitoring.WahToolsStatus is { IsAvailable: true } feeshStatus &&
+            WahToolsFeeshStatusPolicy.IsTripFailed(feeshStatus))
+        {
+            var reason = string.IsNullOrWhiteSpace(feeshStatus.TripStatus)
+                             ? "WahTools boat trip failed."
+                             : $"WahTools boat trip failed: {feeshStatus.TripStatus}";
+            if (session.OceanTerritoryEntered)
+                HandleFailure(RecoveryFailureCode.OceanDutyExitedUnconfirmed, reason);
+            else
+                Fail(reason);
+            return;
         }
 
         var timeout = session.OceanDutyStarted ? OceanVoyageTimeout : OceanDutyStartTimeout;
@@ -1057,19 +1382,23 @@ public sealed class HandoffController : IDisposable
         {
             Fail(session.OceanDutyStarted
                      ? "Ocean Fishing voyage did not complete within two hours."
-                     : "Henchman did not enter Ocean Fishing within 30 minutes.");
+                     : "WahTools did not enter Ocean Fishing within 30 minutes.");
             return;
         }
 
-        if (!henchman.TryGetState(out var busy))
+        if (observation == OceanFishingObservation.TerritoryExitedUnconfirmed)
         {
-            Wait(now, "Waiting for Henchman state IPC while Ocean Fishing is in progress.");
+            HandleFailure(
+                RecoveryFailureCode.OceanDutyExitedUnconfirmed,
+                "Ocean territory exited without confirmed duty completion.");
             return;
         }
 
-        if (!busy)
+        if (session.WahToolsLaunchAmbiguous && !session.OceanTerritoryEntered && HasTimedOut(now, TimeSpan.FromMinutes(2)))
         {
-            Fail("Henchman stopped before QR observed Ocean Fishing completion.");
+            session.OceanFishingLegSkipped = true;
+            save();
+            EnterManualIntervention("WahTools launch outcome is ambiguous and no voyage entry was observed. Confirm Feesh stopped before returning to another character.");
             return;
         }
 
@@ -1077,7 +1406,7 @@ public sealed class HandoffController : IDisposable
             now,
             session.OceanDutyStarted
                 ? "Ocean Fishing voyage active; waiting for duty completion."
-                : "Henchman is preparing and boarding for Ocean Fishing.");
+                : "Waiting for WahTools to enter Ocean Fishing.");
     }
 
     private void UpdateWaitingForOceanCleanup(DateTime now)
@@ -1093,89 +1422,104 @@ public sealed class HandoffController : IDisposable
             return;
 
         nextOceanCleanupPollUtc = now + OceanCleanupPollInterval;
-        if (!henchman.TryGetState(out var henchmanBusy))
-        {
-            ResetOceanCleanupStability();
-            Wait(now, "Waiting for Henchman state IPC during Ocean Fishing cleanup.");
-            return;
-        }
-
-        if (!henchmanBusy)
-        {
-            Fail("Henchman stopped before QR confirmed Ocean Fishing cleanup.");
-            return;
-        }
-
         var snapshot = CaptureOceanCleanupSnapshot();
-        if (!OceanFishingCleanupPolicy.CanAccumulateStableTime(snapshot))
+        var cleanupReasons = OceanFishingCleanupPolicy.GetWaitReasons(snapshot, CapturePlayerBlockers()).ToList();
+        var confirmationSource = SelectCleanupConfirmationSource(null, out var confirmationNowUtc);
+        if (confirmationSource == OceanCleanupConfirmationSource.WahToolsReflection && monitoring.WahToolsStatus is { } feeshStatus)
         {
-            ResetOceanCleanupStability();
-            Wait(now, "Waiting for Henchman to finish post-voyage cleanup and return.");
+            if (WahToolsFeeshStatusPolicy.IsTripFailed(feeshStatus))
+            {
+                EnterManualIntervention($"WahTools boat trip failed during cleanup: {feeshStatus.TripStatus ?? "no failure detail"}");
+                return;
+            }
+
+            if (WahToolsFeeshStatusPolicy.HasCleanerFailure(feeshStatus))
+            {
+                EnterManualIntervention($"WahTools cleaner failed: {feeshStatus.CleanerStatus ?? "no failure detail"}");
+                return;
+            }
+
+            cleanupReasons.AddRange(WahToolsFeeshStatusPolicy.GetCleanupBlockers(feeshStatus));
+        }
+        if (cleanupReasons.Count > 0)
+        {
+            var fallback = confirmationSource == OceanCleanupConfirmationSource.GameStateFallback
+                               ? $"WahTools status unavailable or stale ({monitoring.WahToolsStatus?.Detail ?? "not read"}); using game-state fallback; "
+                               : string.Empty;
+            monitoring.OceanCleanupWaitReason = fallback + string.Join("; ", cleanupReasons);
+            ResetOceanCleanupStability(monitoring.OceanCleanupWaitReason);
+            monitoring.OceanCleanupStableElapsedSeconds = null;
+            Wait(now, "Waiting for WahTools cleanup and safe post-voyage conditions.");
             return;
         }
 
         var localPlayer = objectTable.LocalPlayer;
         if (localPlayer is null)
         {
-            ResetOceanCleanupStability();
-            Wait(now, "Waiting for the player to become available after Ocean Fishing.");
+            monitoring.OceanCleanupWaitReason = "local player unavailable";
+            ResetOceanCleanupStability(monitoring.OceanCleanupWaitReason);
+            Wait(now, "Ocean Fishing cleanup blocked: local player unavailable.");
             return;
         }
 
         var position = localPlayer.Position;
         var contentId = playerState.ContentId;
         var territory = clientState.TerritoryType;
-        if (oceanCleanupStableSinceUtc is null ||
-            oceanCleanupStableTerritory != territory ||
-            oceanCleanupStableContentId != contentId ||
-            oceanCleanupStablePosition is not { } stablePosition ||
-            Vector3.Distance(position, stablePosition) > OceanPositionTolerance)
+        if (!UpdateCleanupConfirmation(confirmationNowUtc, position, contentId, territory, confirmationSource))
         {
-            oceanCleanupStableSinceUtc = now;
-            oceanCleanupStablePosition = position;
-            oceanCleanupStableTerritory = territory;
-            oceanCleanupStableContentId = contentId;
-            monitoring.OceanCleanupStableSinceUtc = now;
-            Wait(now, "Ocean Fishing cleanup state became stable; confirming for 30 seconds.");
+            var sourceName = confirmationSource == OceanCleanupConfirmationSource.WahToolsReflection ? "reflected" : "fallback";
+            Wait(now, $"Confirming {sourceName} post-voyage state.");
             return;
         }
 
-        monitoring.OceanCleanupStableSinceUtc = oceanCleanupStableSinceUtc;
-        if (now < oceanCleanupStableSinceUtc.Value + OceanCleanupStableDuration)
-        {
-            Wait(now, "Confirming stable post-voyage cleanup state before stopping Henchman.");
-            return;
-        }
-
-        StopHenchman(session);
+        monitoring.OceanCleanupWaitReason = $"{confirmationSource} cleanup state confirmed; requesting WahTools stop";
+        StopWahTools(session);
     }
 
-    private void StopHenchman(HandoffSession session)
+    private void StopWahTools(HandoffSession session)
     {
-        if (!henchman.TryGetState(out var busy))
+        if (session.WahToolsStopRequested)
         {
-            Fail("Henchman state IPC became unavailable before cleanup completed.");
+            if (session.WahToolsStopAcceptedUtc is null)
+            {
+                EnterManualIntervention("WahTools Stop outcome is ambiguous. Confirm Feesh stopped before returning to another character.");
+                return;
+            }
+
+            SetPhase(HandoffPhase.WaitingForWahToolsStop, reason: "WahTools Stop was accepted; awaiting fresh post-stop status.");
             return;
         }
 
-        if (!busy)
+        if (!session.WahToolsLaunchAccepted || session.WahToolsLaunchAmbiguous || !wahToolsSessionObservedThisRuntime)
         {
-            session.HenchmanStopConfirmed = true;
-            save();
-            CompleteOceanFishingLeg(session, "Henchman already finished after Ocean Fishing cleanup.");
+            if (session.OceanFishingLegSkipped)
+                EnterManualIntervention("Feesh stop ownership is unproven. Confirm Feesh stopped before returning to another character.");
+            else
+                CompleteOceanFishingLeg(session, "Ocean Fishing completed; no WahTools stop issued because launch ownership is uncertain.");
             return;
         }
 
-        session.HenchmanStopRequested = true;
+        session.WahToolsStopRequested = true;
+        session.WahToolsStopRequestedUtc = DateTime.UtcNow;
+        session.WahToolsStopStatusGeneration = monitoring.WahToolsStatus?.Generation;
         save();
-        if (!henchman.TryCancelAllTasks(out var error))
+        var result = wahToolsFeesh.Stop(out var error);
+        if (result == FeeshIpcResult.Unavailable)
         {
-            Fail(error);
+            EnterManualIntervention($"WahTools stop IPC unavailable; cannot prove Feesh travel stopped safely: {error}");
             return;
         }
 
-        log.Information("QR-owned Henchman cancellation requested. Session={Session}.", SessionId());
-        SetPhase(HandoffPhase.WaitingForHenchmanStop);
+        if (result == FeeshIpcResult.Refused)
+        {
+            EnterManualIntervention($"WahTools refused Stop; cannot prove Feesh travel stopped safely: {error}");
+            return;
+        }
+
+        session.WahToolsStopAcceptedUtc = DateTime.UtcNow;
+        save();
+        ResetOceanCleanupStability();
+        SetPhase(HandoffPhase.WaitingForWahToolsStop, reason: "WahTools Stop was accepted; awaiting fresh post-stop status.");
     }
 
     private void ReleaseYesAlreadyLease(HandoffSession session)
@@ -1185,52 +1529,7 @@ public sealed class HandoffController : IDisposable
 
         yesAlreadyLease.Release();
         session.YesAlreadyLeaseAcquired = false;
-        log.Information("YesAlready lease released after Ocean Fishing duty ownership was established. Session={Session}.", SessionId());
-    }
-
-    private void UpdateWaitingForHenchmanStop(DateTime now)
-    {
-        var session = configuration.ActiveSession;
-        if (session is null || !IsOceanLeg(session))
-        {
-            Fail("Ocean Fishing handoff data is missing while stopping Henchman.");
-            return;
-        }
-
-        if (HasTimedOut(now, HenchmanStopTimeout))
-        {
-            Fail("Henchman did not stop within 30 seconds after QR cancellation.");
-            return;
-        }
-
-        if (!henchman.TryGetState(out var busy))
-        {
-            Wait(now, "Waiting for Henchman state IPC after cancellation.");
-            return;
-        }
-
-        if (busy)
-        {
-            Wait(now, "Waiting for QR-owned Henchman task to stop.");
-            return;
-        }
-
-        session.HenchmanStopConfirmed = true;
-        save();
-        CompleteOceanFishingLeg(session, "Henchman stopped after Ocean Fishing cleanup.");
-    }
-
-    private void CompleteOceanFishingLeg(HandoffSession session, string reason)
-    {
-        session.OceanFishingLegCompleted = true;
-        session.CurrentLeg = HandoffLeg.None;
-        session.ReturningForAutoRetainer = false;
-        if (session.OceanWindowStartUtc is { } windowStart)
-            configuration.LastHandledOceanFishingWindowUtc = windowStart;
-        ReleaseYesAlreadyLease(session);
-        save();
-        log.Information("Ocean Fishing leg complete; checking chained work. Session={Session}.", SessionId());
-        SetPhase(HandoffPhase.CheckingChainedWork, reason: reason);
+        log.Information("YesAlready Ocean Fishing lease released. Session={Session}.", SessionId());
     }
 
     private void UpdateWaitingForAutoRetainerIdle(DateTime now)
@@ -1418,6 +1717,12 @@ public sealed class HandoffController : IDisposable
             return;
         }
 
+        if (session.NextReturnCharacterAttemptUtc is { } nextReturn && now < nextReturn)
+        {
+            Wait(now, "Waiting before retrying original-character login.");
+            return;
+        }
+
         if (clientState.IsLoggedIn && !IsSafeForHandoff())
         {
             Wait(now, $"Waiting for a safe player state before returning; blockers: {MonitoringStatusFormatter.FormatPlayerBlockers(CapturePlayerBlockers())}.");
@@ -1439,10 +1744,17 @@ public sealed class HandoffController : IDisposable
         lastActionUtc = now;
         if (!lifestream.TryChangeCharacter(session.OriginalName, session.OriginalWorld, out var error))
         {
+            session.ReturnCharacterAttempts++;
+            session.NextReturnCharacterAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.ReturnCharacterAttempts);
+            save();
+            diagnosticLog.Write("character-switch-retry", $"original|{session.ReturnCharacterAttempts}|{error}",
+                $"CharacterSwitchRetry Session={SessionId()} Phase={Phase} Operation=ReturnOriginal Target={session.OriginalName}@{session.OriginalWorld} TargetContentId={session.OriginalContentId} Attempt={session.ReturnCharacterAttempts} Result=Rejected Error={error} NextAttemptUtc={session.NextReturnCharacterAttemptUtc:O}.", now);
             Wait(now, $"Lifestream return request was rejected: {error}.");
             return;
         }
 
+        session.NextReturnCharacterAttemptUtc = null;
+        save();
         Notify($"Returning to {session.OriginalName}@{session.OriginalWorld}.");
         SetPhase(HandoffPhase.WaitingForOriginal);
     }
@@ -1616,6 +1928,55 @@ public sealed class HandoffController : IDisposable
             Complete(currentQuestId);
     }
 
+    private bool CanAdvanceWithDependencies(DateTime now)
+    {
+        var gatePhase = Phase == HandoffPhase.RecoveringHandoff &&
+                        configuration.ActiveSession is { RecoveryAction: RecoveryAction.WaitForActiveAutomation } oceanSession &&
+                        IsOceanLeg(oceanSession)
+            ? HandoffPhase.WaitingForOceanDuty : Phase;
+        var required = RecoveryDependencyPolicy.RequiredFor(gatePhase);
+        bool? autoBusy = null;
+        bool? lifestreamBusy = null;
+        if (required.AutoRetainer && TryGetAutoRetainerState(out var busy, out var multiMode))
+            autoBusy = busy || multiMode;
+        if (required.Lifestream && TryGetLifestreamBusy(out var streamBusy))
+            lifestreamBusy = streamBusy;
+        var questionableAvailable = !required.Questionable || questionable.TryIsRunning(out _);
+        var waitReason = RecoveryDependencyPolicy.GetWaitReason(gatePhase, autoBusy, lifestreamBusy,
+            questionableAvailable, clientState.IsLoggedIn && (playerState.ContentId == 0 || objectTable.LocalPlayer is null));
+        if (waitReason is not null)
+        {
+            dependencyWaitClock.Update(waiting: true, now);
+            activeDependencyGateFingerprint = $"{gatePhase}|{waitReason}";
+            diagnosticLog.Write("dependency-gate", activeDependencyGateFingerprint,
+                $"DependencyGateBlocked Session={SessionId()} Phase={Phase} GatePhase={gatePhase} AutoRetainer={autoBusy?.ToString() ?? "unavailable"} Lifestream={lifestreamBusy?.ToString() ?? "unavailable"} QuestionableAvailable={questionableAvailable} IdentityPending={clientState.IsLoggedIn && (playerState.ContentId == 0 || objectTable.LocalPlayer is null)} Reason={waitReason}.", now);
+            SetMonitoring(MonitoringState.Recovering, waitReason, now);
+            return false;
+        }
+
+        // Dependency waiting is not an attempted action and must not exhaust its timeout.
+        var dependencyWaitElapsed = dependencyWaitClock.Update(waiting: false, now);
+        phaseStartedUtc += dependencyWaitElapsed;
+        if (activeDependencyGateFingerprint is { } previousGate)
+        {
+            diagnosticLog.Write("dependency-gate-release", previousGate,
+                $"DependencyGateReleased Session={SessionId()} Phase={Phase} Gate={previousGate} BlockedSeconds={dependencyWaitElapsed.TotalSeconds:0.0} TimeoutBudgetAdjustedSeconds={dependencyWaitElapsed.TotalSeconds:0.0}.", now);
+            activeDependencyGateFingerprint = null;
+        }
+        return true;
+    }
+
+    private void LogStartupRecoveryDecision(HandoffSession session, HandoffPhase savedPhase, HandoffPhase selectedPhase, string reason)
+    {
+        var contentId = clientState.IsLoggedIn && playerState.ContentId != 0 ? (ulong?)playerState.ContentId : null;
+        log.Information(
+            "Startup recovery decision. Session={Session} SavedPhase={SavedPhase} SelectedPhase={SelectedPhase} SessionAgeSeconds={SessionAgeSeconds:0.0} Leg={Leg} OceanDutyCompleted={OceanDutyCompleted} OceanLegCompleted={OceanLegCompleted} CurrentContentId={CurrentContentId} OnOriginal={OnOriginal} ResumeAuthorized={ResumeAuthorized} MonitoringEnabled={MonitoringEnabled} Reason={Reason}.",
+            SessionId(), savedPhase, selectedPhase, SessionElapsedSeconds(DateTime.UtcNow), session.CurrentLeg,
+            session.OceanDutyCompleted, session.OceanFishingLegCompleted, contentId?.ToString() ?? "unknown",
+            contentId is not null && contentId == session.OriginalContentId,
+            manualResumeAuthorized || questionablePausedThisRuntime, configuration.Enabled, reason);
+    }
+
     private void TryInitializeRecovery()
     {
         var session = configuration.ActiveSession;
@@ -1627,23 +1988,27 @@ public sealed class HandoffController : IDisposable
         }
 
         EnsureCorrelationId(session);
-        if (session.Phase == HandoffPhase.RecoveringHandoff)
+        var onOriginalForStartup = clientState.IsLoggedIn && playerState.ContentId != 0 &&
+                                   playerState.ContentId == session.OriginalContentId;
+        var selectedPhase = StartupRecoveryPolicy.SelectPhase(session,
+            manualResumeAuthorized || questionablePausedThisRuntime, onOriginalForStartup);
+        if (selectedPhase is { } startupPhase)
         {
             recoveryPending = false;
-            henchmanOwnedThisRuntime = false;
-            SetPhase(HandoffPhase.RecoveringHandoff, reason: "Resuming persisted automatic handoff recovery.");
-            return;
-        }
-        if (session.Phase == HandoffPhase.CheckingChainedWork)
-        {
-            recoveryPending = false;
-            var onOriginalDuringChain = clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId;
-            SetPhase(
-                onOriginalDuringChain
-                    ? HandoffPhase.AwaitingManualQuestionableResume
-                    : HandoffPhase.ReturningOriginal,
-                reason: "Recovered between chained legs; optional chained work will not be dispatched after reload.");
-            Notify("Recovered between chained legs. Manual Questionable resume is required.", NotificationType.Warning);
+            ResetOceanCleanupStability();
+            var savedPhase = session.Phase;
+            var reason = startupPhase is HandoffPhase.Error or HandoffPhase.ManualIntervention
+                ? !string.IsNullOrWhiteSpace(session.RecoveryMessage) ? session.RecoveryMessage
+                    : !string.IsNullOrWhiteSpace(session.LastError) ? session.LastError
+                    : "Persisted recovery requires manual intervention."
+                : startupPhase == HandoffPhase.AwaitingManualQuestionableResume
+                    ? "Manual resume required; Questionable will not start automatically after reload."
+                    : $"Recovered saved workflow stage: {MonitoringStatusFormatter.FormatPhase(startupPhase)}.";
+            if (startupPhase == HandoffPhase.ManualIntervention &&
+                savedPhase is not (HandoffPhase.ManualIntervention or HandoffPhase.Error))
+                EnterManualIntervention("Persisted WahTools Stop request has no acceptance result. Verify Feesh stopped before returning.");
+            else
+                SetPhase(startupPhase, reason: reason);
             return;
         }
 
@@ -1721,79 +2086,52 @@ public sealed class HandoffController : IDisposable
 
     private void TryInitializeOceanRecovery(HandoffSession session)
     {
-        if (session.YesAlreadyLeaseRequired && !session.OceanDutyStarted)
-        {
-            var leaseResult = yesAlreadyLease.TryAcquire(out var leaseError);
-            if (leaseResult != YesAlreadyLeaseResult.Acquired)
-            {
-                SetMonitoring(
-                    MonitoringState.Recovering,
-                    leaseResult == YesAlreadyLeaseResult.Unavailable
-                        ? leaseError
-                        : "Waiting for YesAlready before continuing the pre-voyage Ocean Fishing recovery.",
-                    DateTime.UtcNow);
-                return;
-            }
-
-            session.YesAlreadyLeaseAcquired = true;
-            save();
-        }
-
-        if (!henchman.TryGetState(out var henchmanBusy))
-        {
-            SetMonitoring(MonitoringState.Recovering, "Waiting for Henchman state IPC before Ocean Fishing recovery can continue.", DateTime.UtcNow);
-            return;
-        }
-
         recoveryPending = false;
-        if (henchmanBusy)
+        ResetOceanCleanupStability();
+        if (IsOceanFishingDutyActive())
         {
-            var recoveryPhase = session.HenchmanStopRequested && !session.HenchmanStopConfirmed
-                                    ? HandoffPhase.WaitingForHenchmanStop
-                                    : session.OceanDutyCompleted
-                                    ? HandoffPhase.WaitingForOceanCleanup
-                                    : session.OceanDutyStarted
-                                        ? HandoffPhase.WaitingForOceanDuty
-                                        : session.HenchmanStartObserved
-                                            ? HandoffPhase.WaitingForOceanDuty
-                                            : HandoffPhase.WaitingForHenchmanStart;
-            SetPhase(recoveryPhase, reason: "Henchman remains busy; observing the persisted Ocean Fishing handoff.");
-            Notify("Recovered an interrupted Ocean Fishing handoff; Henchman remains active.");
-            return;
-        }
-
-        if (session.HenchmanStopRequested)
-        {
-            session.HenchmanStopConfirmed = true;
+            session.OceanDutyStarted = true;
+            session.OceanTerritoryEntered = true;
+            wahToolsSessionObservedThisRuntime = true;
+            ReleaseYesAlreadyLease(session);
             save();
-            var onOriginalAfterStop = clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId;
-            SetPhase(
-                onOriginalAfterStop
-                    ? manualResumeAuthorized ? HandoffPhase.ResumingQuestionable : HandoffPhase.AwaitingManualQuestionableResume
-                    : HandoffPhase.ReturningOriginal,
-                reason: "Recovered QR-owned Henchman cancellation after Ocean Fishing.");
+            SetPhase(session.OceanDutyCompleted ? HandoffPhase.WaitingForOceanCleanup : HandoffPhase.WaitingForOceanDuty,
+                reason: "Ocean Fishing duty is active; observing until safe exit.");
+            Notify("Recovered an interrupted Ocean Fishing handoff; voyage remains active.");
             return;
         }
 
-        if (!session.HenchmanStopConfirmed)
+        if (session.OceanDutyCompleted)
         {
-            Fail("Henchman is idle but persisted Ocean Fishing cleanup was not confirmed.");
+            session.OceanTerritoryExited = true;
+            save();
+            SetPhase(
+                HandoffPhase.WaitingForOceanCleanup,
+                reason: "Recovered completed Ocean Fishing voyage; confirming safe cleanup state.");
             return;
         }
 
-        var onOriginal = clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId;
-        var resumePhase = onOriginal
-                              ? manualResumeAuthorized ? HandoffPhase.ResumingQuestionable : HandoffPhase.AwaitingManualQuestionableResume
-                              : HandoffPhase.ReturningOriginal;
-        SetPhase(
-            resumePhase,
-            reason: "Ocean Fishing recovery requires manual Questionable resume authorization.");
+        if (session.WahToolsLaunchAmbiguous)
+        {
+            EnterManualIntervention("WahTools launch outcome is ambiguous and no voyage entry was observed. Confirm Feesh stopped before returning to another character.");
+            return;
+        }
+
+        if (session.WahToolsStopRequested && !session.OceanDutyCompleted)
+        {
+            EnterManualIntervention("WahTools stop outcome was interrupted before confirmation. Confirm Feesh stopped before returning to another character.");
+            return;
+        }
+
+        session.OceanFishingLegSkipped = true;
+        if (session.OceanWindowStartUtc is { } windowStart)
+            configuration.LastHandledOceanFishingWindowUtc = windowStart;
+        save();
+        SetPhase(HandoffPhase.ReturningOriginal, reason: "Reload interrupted Ocean Fishing before completion; restoring original character without stopping unowned Feesh work.");
         log.Information(
-            "Ocean Fishing recovery initialized. Session={Session} HenchmanStopConfirmed={HenchmanStopConfirmed} OnOriginal={OnOriginal}.",
-            SessionId(),
-            session.HenchmanStopConfirmed,
-            onOriginal);
-        Notify("Recovered an interrupted Ocean Fishing handoff; manual Questionable resume is required.");
+            "Ocean Fishing recovery initialized. Session={Session} DutyActive=false LaunchAccepted={LaunchAccepted}.",
+            SessionId(), session.WahToolsLaunchAccepted);
+        Notify("Recovered an interrupted Ocean Fishing handoff; restoring original character.");
     }
 
     private void RefreshLiveDiagnostics(DateTime now)
@@ -1801,6 +2139,9 @@ public sealed class HandoffController : IDisposable
         var playerBlockers = CapturePlayerBlockers();
         monitoring.PlayerLoggedIn = clientState.IsLoggedIn;
         monitoring.PlayerContentIdAvailable = playerState.ContentId != 0;
+        monitoring.CurrentContentId = clientState.IsLoggedIn && playerState.ContentId != 0
+                                          ? playerState.ContentId
+                                          : null;
         monitoring.PlayerBlockers = playerBlockers;
 
         var questionableAvailable = questionable.TryIsRunning(out var questionableRunning);
@@ -1818,9 +2159,6 @@ public sealed class HandoffController : IDisposable
 
         TryGetAutoRetainerState(out _, out _);
         TryGetLifestreamBusy(out _);
-        var henchmanAvailable = henchman.TryGetState(out var henchmanBusy);
-        monitoring.HenchmanAvailable = henchmanAvailable;
-        monitoring.HenchmanBusy = henchmanAvailable && henchmanBusy;
         monitoring.YesAlreadyLeaseAcquired = yesAlreadyLease.IsAcquired;
 
         var oceanState = OceanFishingSchedule.GetState(
@@ -1833,14 +2171,81 @@ public sealed class HandoffController : IDisposable
         monitoring.OceanLaunchEligible = configuration.MonitorOceanFishing && oceanState.LaunchEligible && !monitoring.OceanWindowHandled;
         monitoring.ActiveHandoffKind = configuration.ActiveSession?.Kind;
         var session = configuration.ActiveSession;
+        monitoring.FishingCharacterContentId = session is { FishingContentId: > 0 }
+                                                   ? session.FishingContentId
+                                                   : null;
         monitoring.CurrentHandoffLeg = session?.CurrentLeg;
         monitoring.OceanLegResolved = session?.OceanFishingLegCompleted == true || session?.OceanFishingLegSkipped == true;
         monitoring.AutoRetainerLegResolved = session?.AutoRetainerLegCompleted == true || session?.AutoRetainerLegSkipped == true;
         monitoring.PendingAutoRetainerMode = session?.PendingAutoRetainerMode;
+        monitoring.WahToolsLaunchAccepted = session?.WahToolsLaunchAccepted == true;
         monitoring.OceanDutyStarted = session is not null && IsOceanLeg(session) && session.OceanDutyStarted;
         monitoring.OceanDutyCompleted = session is not null && IsOceanLeg(session) && session.OceanDutyCompleted;
         monitoring.LastDependencyCheckUtc = now;
         lastDependencyRefreshUtc = now;
+    }
+
+    private void RefreshWahToolsStatus(DateTime now)
+    {
+        var session = configuration.ActiveSession;
+        monitoring.CurrentContentId = clientState.IsLoggedIn && playerState.ContentId != 0
+                                          ? playerState.ContentId
+                                          : null;
+        monitoring.FishingCharacterContentId = session is { FishingContentId: > 0 }
+                                                   ? session.FishingContentId
+                                                   : null;
+        var shouldObserve = session?.OceanWindowStartUtc is not null &&
+                            (IsOceanLeg(session) || Phase is HandoffPhase.WaitingForWahToolsStop or HandoffPhase.ManualIntervention);
+        if (!shouldObserve)
+        {
+            monitoring.WahToolsStatus = null;
+            monitoring.WahToolsAvailable = null;
+            monitoring.WahToolsLaunchAccepted = false;
+            monitoring.WahToolsStatusEvaluationUtc = null;
+            monitoring.WahToolsStatusAgeSeconds = null;
+            return;
+        }
+
+        if (now < nextWahToolsStatusRefreshUtc)
+            return;
+
+        var status = wahToolsStatusReader.Read();
+        var statusObservedEvaluationUtc = DateTime.UtcNow;
+        nextWahToolsStatusRefreshUtc = statusObservedEvaluationUtc + TimeSpan.FromSeconds(1);
+        monitoring.WahToolsStatus = status;
+        monitoring.WahToolsAvailable = status.IsAvailable;
+        monitoring.WahToolsStatusEvaluationUtc = statusObservedEvaluationUtc;
+        monitoring.WahToolsStatusAgeSeconds = (statusObservedEvaluationUtc - status.ObservedAtUtc).TotalSeconds;
+        var snapshotFingerprint = status.IsAvailable
+            ? string.Join('|', SessionId(), status.Generation, status.TripInitialized, status.TripState, status.TripStatus,
+                status.TripRunning, status.OnBoat, status.Cleaning, status.CleanerState, status.CleanerStatus,
+                status.CleanerRunning, status.DesyntherRunning, status.DesyntherStatus,
+                status.DiscarderRunning, status.DiscarderStatus, status.BuyerBusy)
+            : $"{SessionId()}|{status.Availability}|{status.Detail}";
+        diagnosticLog.Write("feesh-snapshot", snapshotFingerprint,
+            $"WahToolsSnapshot Session={SessionId()} Phase={Phase} Available={status.IsAvailable} Generation={status.Generation} ObservedUtc={status.ObservedAtUtc:O} EvaluationUtc={statusObservedEvaluationUtc:O} RawAgeSeconds={(statusObservedEvaluationUtc - status.ObservedAtUtc).TotalSeconds:0.000} Detail={status.Detail} TripInitialized={status.TripInitialized} TripState={status.TripState} TripStatus={status.TripStatus} TripRunning={status.TripRunning} OnBoat={status.OnBoat} Cleaning={status.Cleaning} CleanerState={status.CleanerState} CleanerStatus={status.CleanerStatus} CleanerRunning={status.CleanerRunning} DesyntherRunning={status.DesyntherRunning} DesyntherStatus={status.DesyntherStatus} DiscarderRunning={status.DiscarderRunning} DiscarderStatus={status.DiscarderStatus} BuyerBusy={status.BuyerBusy}.", statusObservedEvaluationUtc);
+    }
+
+    private OceanCleanupConfirmationSource SelectCleanupConfirmationSource(
+        DateTime? requireObservedAfterUtc,
+        out DateTime evaluatedAtUtc)
+    {
+        evaluatedAtUtc = DateTime.UtcNow;
+        monitoring.WahToolsStatusEvaluationUtc = evaluatedAtUtc;
+        monitoring.WahToolsStatusAgeSeconds = monitoring.WahToolsStatus is { } status
+                                                  ? (evaluatedAtUtc - status.ObservedAtUtc).TotalSeconds
+                                                  : null;
+        var sourceReason = OceanCleanupConfirmationPolicy.GetSourceReason(
+            monitoring.WahToolsStatus, evaluatedAtUtc, requireObservedAfterUtc);
+        var snapshotAge = monitoring.WahToolsStatus is { } snapshot
+            ? (evaluatedAtUtc - snapshot.ObservedAtUtc).TotalSeconds
+            : (double?)null;
+        diagnosticLog.Write("cleanup-source", $"{SessionId()}|{sourceReason}|{monitoring.WahToolsStatus?.Generation}",
+            $"CleanupSourceDecision Session={SessionId()} Phase={Phase} Reason={sourceReason} Source={OceanCleanupConfirmationPolicy.SelectSource(monitoring.WahToolsStatus, evaluatedAtUtc, requireObservedAfterUtc)} Generation={monitoring.WahToolsStatus?.Generation.ToString() ?? "none"} SnapshotUtc={monitoring.WahToolsStatus?.ObservedAtUtc.ToString("O") ?? "none"} EvaluationUtc={evaluatedAtUtc:O} RawAgeSeconds={snapshotAge?.ToString("0.000") ?? "none"} RequireObservedAfterUtc={requireObservedAfterUtc?.ToString("O") ?? "none"}.", evaluatedAtUtc);
+        return OceanCleanupConfirmationPolicy.SelectSource(
+            monitoring.WahToolsStatus,
+            evaluatedAtUtc,
+            requireObservedAfterUtc);
     }
 
     private IReadOnlyList<string> GetPlayerBlockers()
@@ -1936,14 +2341,243 @@ public sealed class HandoffController : IDisposable
             multiModeActive);
     }
 
-    private void ResetOceanCleanupStability()
+    private void UpdateWaitingForWahToolsStop(DateTime now)
     {
+        var session = configuration.ActiveSession;
+        if (session is null ||
+            !OceanFishingPolicy.HasWahToolsStopSession(session) ||
+            session.WahToolsStopAcceptedUtc is not { } stopAcceptedUtc)
+        {
+            EnterManualIntervention("WahTools Stop acceptance is unknown; verify Feesh stopped before returning.");
+            return;
+        }
+
+        var source = SelectCleanupConfirmationSource(stopAcceptedUtc, out var confirmationNowUtc);
+        if (source == OceanCleanupConfirmationSource.None)
+        {
+            monitoring.OceanCleanupWaitReason = "awaiting fresh WahTools status observed after Stop";
+            ResetOceanCleanupStability(monitoring.OceanCleanupWaitReason);
+            Wait(now, "WahTools Stop accepted; awaiting fresh post-stop snapshot.");
+            return;
+        }
+
+        if (source == OceanCleanupConfirmationSource.WahToolsReflection &&
+            monitoring.WahToolsStatus is { } freshStatus &&
+            session.WahToolsStopStatusGeneration != freshStatus.Generation)
+        {
+            log.Information(
+                "WahTools instance generation changed after Stop. Session={Session} Before={Before} After={After}; restarting cleanup confirmation.",
+                SessionId(),
+                session.WahToolsStopStatusGeneration?.ToString() ?? "unknown",
+                freshStatus.Generation);
+            session.WahToolsStopStatusGeneration = freshStatus.Generation;
+            save();
+        }
+
+        if (source == OceanCleanupConfirmationSource.WahToolsReflection && monitoring.WahToolsStatus is { } feeshStatus)
+        {
+            if (WahToolsFeeshStatusPolicy.IsTripFailed(feeshStatus))
+            {
+                EnterManualIntervention($"WahTools trip failed after Stop: {feeshStatus.TripStatus ?? "no failure detail"}");
+                return;
+            }
+
+            if (WahToolsFeeshStatusPolicy.HasCleanerFailure(feeshStatus))
+            {
+                EnterManualIntervention($"WahTools cleaner failed after Stop: {feeshStatus.CleanerStatus ?? "no failure detail"}");
+                return;
+            }
+        }
+
+        if (!CanAccumulateSafeFishingReturn(confirmationNowUtc, source))
+        {
+            Wait(now, $"Confirming {GetConfirmationSourceLabel(source)} post-stop safe state.");
+            return;
+        }
+
+        if (session.OceanFishingLegSkipped)
+        {
+            session.CurrentLeg = HandoffLeg.None;
+            session.OceanTerritoryExited = !IsOceanFishingTerritory();
+            ReleaseYesAlreadyLease(session);
+            save();
+            SetPhase(HandoffPhase.ReturningOriginal, reason: "Failed Ocean Fishing attempt stopped and confirmed; restoring original character.");
+            return;
+        }
+
+        CompleteOceanFishingLeg(session, "Ocean Fishing completed and WahTools Stop was observed idle.");
+    }
+
+    private void CompleteOceanFishingLeg(HandoffSession session, string reason)
+    {
+        session.OceanFishingLegCompleted = true;
+        session.CurrentLeg = HandoffLeg.None;
+        session.ReturningForAutoRetainer = false;
+        if (session.OceanWindowStartUtc is { } windowStart)
+            configuration.LastHandledOceanFishingWindowUtc = windowStart;
+        ReleaseYesAlreadyLease(session);
+        ResetOceanCleanupDiagnostics();
+        save();
+        log.Information("Ocean Fishing leg complete; checking chained work. Session={Session}.", SessionId());
+        SetPhase(HandoffPhase.CheckingChainedWork, reason: reason);
+    }
+
+    private void ResetOceanCleanupDiagnostics()
+    {
+        ResetOceanCleanupStability();
+        monitoring.OceanCleanupWaitReason = string.Empty;
+        monitoring.WahToolsStatus = null;
+        monitoring.WahToolsAvailable = null;
+        monitoring.WahToolsLaunchAccepted = false;
+        monitoring.WahToolsStatusEvaluationUtc = null;
+        monitoring.WahToolsStatusAgeSeconds = null;
+    }
+
+    private bool CanAccumulateSafeFishingReturn(DateTime now, OceanCleanupConfirmationSource source)
+    {
+        var player = objectTable.LocalPlayer;
+        var blockers = CapturePlayerBlockers();
+        var reasons = GetSafeFishingReturnBlockers(player, blockers, source);
+
+        if (reasons.Count > 0)
+        {
+            monitoring.OceanCleanupWaitReason = string.Join("; ", reasons);
+            ResetOceanCleanupStability(monitoring.OceanCleanupWaitReason);
+            return false;
+        }
+
+        if (source == OceanCleanupConfirmationSource.GameStateFallback)
+            monitoring.OceanCleanupWaitReason = $"WahTools status unavailable or stale ({monitoring.WahToolsStatus?.Detail ?? "not read"}); using game-state fallback";
+
+        return UpdateCleanupConfirmation(now, player!.Position, playerState.ContentId, clientState.TerritoryType, source);
+    }
+
+    private List<string> GetSafeFishingReturnBlockers(
+        object? player,
+        IReadOnlyList<string> blockers,
+        OceanCleanupConfirmationSource source)
+    {
+        var reasons = new List<string>();
+        if (IsOceanFishingTerritory())
+            reasons.Add("still in Ocean Fishing territory");
+        if (player is null)
+            reasons.Add("local player unavailable");
+        if (blockers.Count > 0)
+            reasons.Add($"player blockers: {string.Join(',', blockers)}");
+        if (!condition[ConditionFlag.NormalConditions])
+            reasons.Add("player is not in normal conditions");
+        if (condition[ConditionFlag.Fishing])
+            reasons.Add("fishing action active");
+        if (condition[ConditionFlag.ExecutingGatheringAction])
+            reasons.Add("gathering action active");
+        if (condition[ConditionFlag.Casting])
+            reasons.Add("casting active");
+        if (condition[ConditionFlag.BetweenAreas] || condition[ConditionFlag.BetweenAreas51])
+            reasons.Add("player changing areas");
+
+        if (!TryGetAutoRetainerState(out var autoBusy, out var multiModeActive))
+            reasons.Add("AutoRetainer state unavailable");
+        else
+        {
+            if (autoBusy)
+                reasons.Add("AutoRetainer busy");
+            if (multiModeActive)
+                reasons.Add($"AutoRetainer Multi Mode active (Busy={autoBusy})");
+        }
+
+        if (!TryGetLifestreamBusy(out var lifestreamBusy))
+            reasons.Add("Lifestream state unavailable");
+        else if (lifestreamBusy)
+            reasons.Add("Lifestream busy");
+
+        if (source == OceanCleanupConfirmationSource.WahToolsReflection && monitoring.WahToolsStatus is { } status)
+            reasons.AddRange(WahToolsFeeshStatusPolicy.GetCleanupBlockers(status));
+        return reasons;
+    }
+
+    private bool UpdateCleanupConfirmation(DateTime now, Vector3 position, ulong contentId, uint territory, OceanCleanupConfirmationSource source)
+    {
+        var generation = source == OceanCleanupConfirmationSource.WahToolsReflection
+                             ? monitoring.WahToolsStatus?.Generation
+                             : null;
+        var sourceChanged = !OceanCleanupConfirmationPolicy.IsSameEvidence(
+            source,
+            generation,
+            monitoring.OceanCleanupConfirmationSource,
+            oceanCleanupConfirmationGeneration);
+        var identityOrPositionChanged = oceanCleanupStableSinceUtc is not null &&
+                                        (oceanCleanupStableTerritory != territory ||
+                                         oceanCleanupStableContentId != contentId ||
+                                         oceanCleanupStablePosition is not { } currentStablePosition ||
+                                         Vector3.Distance(position, currentStablePosition) > OceanPositionTolerance);
+        if ((sourceChanged || identityOrPositionChanged) && oceanCleanupStableSinceUtc is not null)
+        {
+            var distance = oceanCleanupStablePosition is { } oldPosition ? Vector3.Distance(position, oldPosition) : 0;
+            var resetFingerprint = $"{source}|{generation}|{territory}|{contentId}|{identityOrPositionChanged}";
+            diagnosticLog.Write("cleanup-reset", resetFingerprint,
+                $"CleanupConfirmationReset Session={SessionId()} SourceChanged={sourceChanged} PreviousSource={monitoring.OceanCleanupConfirmationSource} CurrentSource={source} PreviousGeneration={oceanCleanupConfirmationGeneration?.ToString() ?? "none"} CurrentGeneration={generation?.ToString() ?? "none"} IdentityOrTerritoryChanged={identityOrPositionChanged} PreviousTerritory={oceanCleanupStableTerritory} CurrentTerritory={territory} PreviousContentId={oceanCleanupStableContentId} CurrentContentId={contentId} MovementDistance={distance:0.000} MovementTolerance={OceanPositionTolerance:0.000} PreviousElapsedSeconds={(now - oceanCleanupStableSinceUtc.Value).TotalSeconds:0.0}.", now);
+        }
+
+        if (sourceChanged ||
+            identityOrPositionChanged ||
+            oceanCleanupStableSinceUtc is null ||
+            oceanCleanupStableTerritory != territory ||
+            oceanCleanupStableContentId != contentId ||
+            oceanCleanupStablePosition is not { } stablePosition ||
+            Vector3.Distance(position, stablePosition) > OceanPositionTolerance)
+        {
+            oceanCleanupStableSinceUtc = now;
+            oceanCleanupStablePosition = position;
+            oceanCleanupStableTerritory = territory;
+            oceanCleanupStableContentId = contentId;
+            oceanCleanupConfirmationGeneration = generation;
+            monitoring.OceanCleanupConfirmationSource = source;
+            monitoring.OceanCleanupStableSinceUtc = now;
+            monitoring.OceanCleanupStableElapsedSeconds = 0;
+            monitoring.OceanCleanupRequiredSeconds = OceanCleanupConfirmationPolicy.GetRequiredDuration(source).TotalSeconds;
+            monitoring.OceanCleanupWaitReason = $"{GetConfirmationSourceLabel(source)} confirmation active";
+            diagnosticLog.Write("cleanup-confirmation", $"started|{source}|{generation}|{territory}|{contentId}",
+                $"CleanupConfirmationStarted Session={SessionId()} Source={source} Generation={generation?.ToString() ?? "none"} StableSinceUtc={now:O} RequiredSeconds={monitoring.OceanCleanupRequiredSeconds:0.0} Territory={territory} ContentId={contentId} Position={position}.", now);
+            return false;
+        }
+
+        monitoring.OceanCleanupStableSinceUtc = oceanCleanupStableSinceUtc;
+        monitoring.OceanCleanupStableElapsedSeconds = (now - oceanCleanupStableSinceUtc.Value).TotalSeconds;
+        monitoring.OceanCleanupRequiredSeconds = OceanCleanupConfirmationPolicy.GetRequiredDuration(source).TotalSeconds;
+        var confirmed = OceanCleanupConfirmationPolicy.HasConfirmedStableTime(oceanCleanupStableSinceUtc.Value, now, source);
+        monitoring.OceanCleanupWaitReason = confirmed
+            ? $"{GetConfirmationSourceLabel(source)} confirmation complete"
+            : $"{GetConfirmationSourceLabel(source)} confirmation in progress";
+        diagnosticLog.Write("cleanup-confirmation", confirmed ? $"complete|{source}|{generation}" : $"progress|{source}|{generation}",
+            $"CleanupConfirmation{(confirmed ? "Completed" : "Progress")} Session={SessionId()} Source={source} Generation={generation?.ToString() ?? "none"} ElapsedSeconds={monitoring.OceanCleanupStableElapsedSeconds:0.0} RequiredSeconds={monitoring.OceanCleanupRequiredSeconds:0.0}.", now);
+        return confirmed;
+    }
+
+    private static string GetConfirmationSourceLabel(OceanCleanupConfirmationSource source) => source switch
+    {
+        OceanCleanupConfirmationSource.WahToolsReflection => "WahTools reflected idle",
+        OceanCleanupConfirmationSource.GameStateFallback => "game-state fallback",
+        _ => "status unknown",
+    };
+
+    private void ResetOceanCleanupStability(string? reason = null)
+    {
+        if (oceanCleanupStableSinceUtc is { } stableSince && reason is not null)
+        {
+            diagnosticLog.Write("cleanup-blocker-reset", reason,
+                $"CleanupConfirmationResetByBlocker Session={SessionId()} Reason={reason} PreviousElapsedSeconds={Math.Max(0, (DateTime.UtcNow - stableSince).TotalSeconds):0.0}.", DateTime.UtcNow);
+        }
+
         nextOceanCleanupPollUtc = DateTime.MinValue;
         oceanCleanupStableSinceUtc = null;
         oceanCleanupStablePosition = null;
         oceanCleanupStableTerritory = 0;
         oceanCleanupStableContentId = 0;
+        oceanCleanupConfirmationGeneration = null;
         monitoring.OceanCleanupStableSinceUtc = null;
+        monitoring.OceanCleanupStableElapsedSeconds = null;
+        monitoring.OceanCleanupRequiredSeconds = null;
+        monitoring.OceanCleanupConfirmationSource = OceanCleanupConfirmationSource.None;
     }
 
     private void AddConditionBlocker(ICollection<string> blockers, ConditionFlag flag)
@@ -1961,6 +2595,12 @@ public sealed class HandoffController : IDisposable
 
     private void HandleSingleMultiModeFinished()
     {
+        if (configuration.ActiveSession is not { CurrentLeg: HandoffLeg.AutoRetainer, AutoRetainerStartRequested: true })
+        {
+            log.Debug("Ignoring AutoRetainer completion callback without a matching active QR dispatch.");
+            return;
+        }
+
         completionEventReceived = true;
         log.Information(
             "AutoRetainer single-pass completion event received. Session={Session} Phase={Phase} StartRequested={StartRequested} MultiModeObserved={MultiModeObserved}.",
@@ -1976,13 +2616,15 @@ public sealed class HandoffController : IDisposable
     private void HandleDutyStarted()
     {
         var session = configuration.ActiveSession;
-        if (session is null || !IsOceanLeg(session) || !session.HenchmanStartObserved || !IsOceanFishingTerritory())
+        if (session is null || !IsOceanLeg(session) || !session.WahToolsLaunchRequested || !IsOceanFishingTerritory())
             return;
 
         if (session.OceanDutyStarted)
             return;
 
+        session.OceanTerritoryEntered = true;
         session.OceanDutyStarted = true;
+        wahToolsSessionObservedThisRuntime = true;
         ReleaseYesAlreadyLease(session);
         save();
         log.Information("Ocean Fishing duty-start event received. Session={Session}.", SessionId());
@@ -2028,43 +2670,55 @@ public sealed class HandoffController : IDisposable
     {
         var now = DateTime.UtcNow;
         var previousPhase = Phase;
+        var effectiveReason = reason ?? (phase is HandoffPhase.Error or HandoffPhase.ManualIntervention
+            ? monitoring.Reason
+            : phase == HandoffPhase.AwaitingManualQuestionableResume
+                ? "Manual resume required; Questionable will not start automatically after reload."
+                : phase == HandoffPhase.RecoveringHandoff ? "Automatic recovery in progress."
+                : $"Handoff phase: {MonitoringStatusFormatter.FormatPhase(phase)}.");
         var phaseElapsed = now - phaseStartedUtc;
+        if (evaluatingStartupRecovery && configuration.ActiveSession is { } recoveredSession)
+            LogStartupRecoveryDecision(recoveredSession, previousPhase, phase, effectiveReason);
         if (previousPhase != phase)
         {
             log.Information(
-                "Handoff phase changed. Session={Session} From={From} To={To} PreviousPhaseElapsedSeconds={PreviousPhaseElapsedSeconds:0.0} SessionElapsedSeconds={SessionElapsedSeconds:0.0}.",
+                "Handoff phase changed. Session={Session} From={From} To={To} PreviousPhaseElapsedSeconds={PreviousPhaseElapsedSeconds:0.0} SessionElapsedSeconds={SessionElapsedSeconds:0.0} Reason={Reason}.",
                 SessionId(),
                 previousPhase,
                 phase,
                 phaseElapsed.TotalSeconds,
-                SessionElapsedSeconds(now));
+                SessionElapsedSeconds(now),
+                effectiveReason);
         }
 
         Phase = phase;
         if (previousPhase != phase)
+        {
             phaseStartedUtc = now;
+            dependencyWaitClock.Reset();
+        }
         if (configuration.ActiveSession is not null)
             configuration.ActiveSession.Phase = phase;
         if (persist)
             save();
         if (phase is HandoffPhase.Error or HandoffPhase.ManualIntervention)
-            SetMonitoring(MonitoringState.Error, reason ?? monitoring.Reason, now);
+            SetMonitoring(MonitoringState.Error, effectiveReason, now);
         else if (phase == HandoffPhase.RecoveringHandoff)
         {
             RefreshLiveDiagnostics(now);
-            SetMonitoring(MonitoringState.Recovering, reason ?? "Automatic recovery in progress.", now);
+            SetMonitoring(MonitoringState.Recovering, effectiveReason, now);
         }
         else if (phase == HandoffPhase.AwaitingManualQuestionableResume)
         {
             SetMonitoring(
                 MonitoringState.Recovering,
-                reason ?? "Manual resume required; Questionable will not start automatically after reload.",
+                effectiveReason,
                 now);
         }
         else if (phase != HandoffPhase.Idle)
         {
             RefreshLiveDiagnostics(now);
-            SetMonitoring(MonitoringState.Processing, reason ?? $"Handoff phase: {MonitoringStatusFormatter.FormatPhase(phase)}.", now);
+            SetMonitoring(MonitoringState.Processing, effectiveReason, now);
         }
     }
 
@@ -2110,6 +2764,7 @@ public sealed class HandoffController : IDisposable
         }
         configuration.ActiveSession = null;
         configuration.ManualRecoveryMessage = string.Empty;
+        diagnosticLog.Reset();
         ResetOceanCleanupStability();
         ResetReadinessDiagnostics();
         monitoring.PlayerBlockers = [];
@@ -2166,12 +2821,21 @@ public sealed class HandoffController : IDisposable
         session.RecoveryLastAttemptUtc = now;
         session.RecoveryNextAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.RecoveryAttemptCount);
         save();
+        diagnosticLog.Write("recovery-attempt", $"{session.RecoveryAction}|{session.RecoveryAttemptCount}",
+            $"RecoveryAttempt Session={SessionId()} Phase={Phase} Leg={session.CurrentLeg} Operation={session.RecoveryAction} Attempt={session.RecoveryAttemptCount} RecoveryOriginPhase={session.RecoveryOriginPhase} RecoveryOriginLeg={session.RecoveryOriginLeg} NextAttemptUtc={session.RecoveryNextAttemptUtc:O}.", now);
 
         switch (session.RecoveryAction)
         {
             case RecoveryAction.RetryCurrentPhase:
+                var retryPhase = session.RecoveryOriginPhase;
                 ClearRecoveryAttempt(session);
-                SetPhase(session.RecoveryOriginPhase, reason: "Retrying recoverable handoff operation.");
+                if (retryPhase is HandoffPhase.Idle or HandoffPhase.RecoveringHandoff)
+                {
+                    EnterManualIntervention("Recovery retry has no valid originating handoff phase.");
+                    return;
+                }
+
+                SetPhase(retryPhase, reason: "Retrying recoverable handoff operation.");
                 return;
 
             case RecoveryAction.AbandonUnstartedHandoff:
@@ -2185,9 +2849,9 @@ public sealed class HandoffController : IDisposable
             case RecoveryAction.WaitForActiveAutomation:
                 if (IsOceanLeg(session))
                 {
-                    if (IsOceanFishingDutyActive() || (henchman.TryGetState(out var oceanBusy) && oceanBusy))
+                    if (IsOceanFishingDutyActive())
                     {
-                        Wait(now, "Waiting for active Ocean Fishing automation to finish; QR will not preempt it.");
+                        Wait(now, "Waiting for active Ocean Fishing duty to finish; QR will not preempt it.");
                         return;
                     }
 
@@ -2210,10 +2874,6 @@ public sealed class HandoffController : IDisposable
                 SkipCurrentLegAndContinue(session);
                 return;
 
-            case RecoveryAction.CancelHenchmanThenRestore:
-                UpdateHenchmanCancellationRecovery(session, now);
-                return;
-
             case RecoveryAction.ReturnOriginalAndResume:
                 ClearRecoveryAttempt(session);
                 if (clientState.IsLoggedIn && playerState.ContentId == session.OriginalContentId && IsSafeForHandoff())
@@ -2226,61 +2886,6 @@ public sealed class HandoffController : IDisposable
                 EnterManualIntervention(session.RecoveryMessage);
                 return;
         }
-    }
-
-    private void UpdateHenchmanCancellationRecovery(HandoffSession session, DateTime now)
-    {
-        if (IsOceanFishingDutyActive())
-        {
-            session.RecoveryAction = RecoveryAction.WaitForActiveAutomation;
-            session.RecoveryNextAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.RecoveryAttemptCount);
-            save();
-            Wait(now, "Ocean Fishing duty is active; waiting before safe Henchman recovery.");
-            return;
-        }
-
-        if (!henchman.TryGetState(out var busy))
-        {
-            Wait(now, "Waiting for Henchman state before automatic recovery.");
-            return;
-        }
-
-        if (!busy)
-        {
-            session.OceanAbortConfirmed = true;
-            session.HenchmanStopConfirmed = true;
-            SkipCurrentLegAndContinue(session);
-            return;
-        }
-
-        if (!henchmanOwnedThisRuntime)
-        {
-            session.RecoveryAction = RecoveryAction.WaitForActiveAutomation;
-            session.RecoveryNextAttemptUtc = now + RecoveryBackoffPolicy.GetDelay(session.RecoveryAttemptCount);
-            save();
-            Wait(now, "Henchman ownership is not provable after reload; waiting without cancellation.");
-            return;
-        }
-
-        if (now < lastActionUtc + ActionRetryInterval)
-        {
-            Wait(now, "Waiting before retrying QR-owned Henchman cancellation.");
-            return;
-        }
-
-        lastActionUtc = now;
-        session.OceanAbortRequested = true;
-        session.HenchmanStopRequested = true;
-        if (!henchman.TryCancelAllTasks(out var error))
-        {
-            log.Warning("Automatic Henchman cancellation will retry. Session={Session} Error={Error}.", SessionId(), error);
-            Wait(now, $"Henchman cancellation unavailable; retrying automatically: {error}");
-            return;
-        }
-
-        session.HenchmanOwnership = HenchmanOwnership.CancellationRequested;
-        save();
-        Wait(now, "QR-owned Henchman cancellation requested; waiting for idle.");
     }
 
     private void AbandonUnstartedHandoff(HandoffSession session)
@@ -2298,14 +2903,48 @@ public sealed class HandoffController : IDisposable
     {
         if (IsOceanLeg(session))
         {
+            if (session.OceanDutyCompleted)
+            {
+                ClearRecoveryAttempt(session);
+                save();
+                SetPhase(HandoffPhase.WaitingForOceanCleanup, reason: "Voyage completion is confirmed; waiting for safe cleanup before returning.");
+                return;
+            }
+
             session.OceanFishingLegSkipped = !session.OceanDutyCompleted;
             session.OceanFishingLegCompleted = session.OceanDutyCompleted;
             session.OceanWindowConsumed = true;
-            session.HenchmanStopConfirmed = true;
+            session.OceanTerritoryExited = !IsOceanFishingTerritory();
             session.CurrentLeg = HandoffLeg.None;
             if (session.OceanWindowStartUtc is { } windowStart)
                 configuration.LastHandledOceanFishingWindowUtc = windowStart;
             ReleaseYesAlreadyLease(session);
+            if (!session.OceanDutyCompleted &&
+                session.WahToolsLaunchAccepted &&
+                !session.WahToolsLaunchAmbiguous &&
+                wahToolsSessionObservedThisRuntime)
+            {
+                session.WahToolsStopRequested = true;
+                session.WahToolsStopRequestedUtc = DateTime.UtcNow;
+                session.WahToolsStopStatusGeneration = monitoring.WahToolsStatus?.Generation;
+                save();
+                var stopResult = wahToolsFeesh.Stop(out var stopError);
+                if (stopResult != FeeshIpcResult.Accepted)
+                {
+                    EnterManualIntervention($"Ocean Fishing attempt failed before duty entry and WahTools Stop was not confirmed: {stopError}");
+                    return;
+                }
+
+                session.WahToolsStopAcceptedUtc = DateTime.UtcNow;
+                ClearRecoveryAttempt(session);
+                session.AutoRetainerLegSkipped = true;
+                session.PendingAutoRetainerMode = null;
+                session.ReturningForAutoRetainer = false;
+                save();
+                ResetOceanCleanupStability();
+                SetPhase(HandoffPhase.WaitingForWahToolsStop, reason: "Failed voyage launch stopped; waiting for stable state before restoring original character.");
+                return;
+            }
         }
         else if (session.CurrentLeg == HandoffLeg.AutoRetainer)
         {
@@ -2317,7 +2956,11 @@ public sealed class HandoffController : IDisposable
 
         ClearRecoveryAttempt(session);
         save();
-        SetPhase(HandoffPhase.CheckingChainedWork, reason: "Recoverable handoff leg resolved; checking remaining work.");
+        session.AutoRetainerLegSkipped = true;
+        session.PendingAutoRetainerMode = null;
+        session.ReturningForAutoRetainer = false;
+        save();
+        SetPhase(HandoffPhase.ReturningOriginal, reason: "Recoverable handoff leg resolved; restoring the original character before optional work.");
     }
 
     private void ClearRecoveryAttempt(HandoffSession session)
@@ -2336,8 +2979,18 @@ public sealed class HandoffController : IDisposable
 
     private void EnterManualIntervention(string message)
     {
+        log.Warning(
+            "Manual intervention required. Session={Session} From={From} Reason={Reason} FailureCode={FailureCode} StopRequestedUtc={StopRequestedUtc} StopAcceptedUtc={StopAcceptedUtc}.",
+            SessionId(), Phase, message, configuration.ActiveSession?.RecoveryFailureCode?.ToString() ?? "none",
+            configuration.ActiveSession?.WahToolsStopRequestedUtc?.ToString("O") ?? "none",
+            configuration.ActiveSession?.WahToolsStopAcceptedUtc?.ToString("O") ?? "none");
         if (configuration.ActiveSession is { } session)
         {
+            if (Phase is not (HandoffPhase.Error or HandoffPhase.ManualIntervention or HandoffPhase.RecoveringHandoff))
+            {
+                session.RecoveryOriginPhase = Phase;
+                session.RecoveryOriginLeg = session.CurrentLeg;
+            }
             session.RecoveryAction = RecoveryAction.ManualIntervention;
             session.RecoveryMessage = message;
             session.LastError = message;
@@ -2403,7 +3056,6 @@ public sealed class HandoffController : IDisposable
             return;
         }
 
-        var henchmanKnown = henchman.TryGetState(out var henchmanBusy);
         var autoKnown = TryGetAutoRetainerState(out var autoBusy, out var multiModeActive);
         var dutyActive = IsOceanFishingDutyActive();
         var decision = RecoveryPolicy.Decide(new(
@@ -2411,9 +3063,9 @@ public sealed class HandoffController : IDisposable
             phase,
             leg,
             SessionValid: true,
-            henchmanKnown,
-            henchmanBusy,
-            henchmanOwnedThisRuntime,
+            HenchmanStateKnown: false,
+            HenchmanBusy: false,
+            HenchmanOwnedThisRuntime: false,
             dutyActive,
             session.OceanDutyStarted,
             session.OceanDutyCompleted,
@@ -2425,9 +3077,6 @@ public sealed class HandoffController : IDisposable
             IsSafeForHandoff()));
         var action = decision.Action;
 
-        if (!henchmanKnown && leg == HandoffLeg.OceanFishing &&
-            failure is (RecoveryFailureCode.HenchmanStateUnavailable or RecoveryFailureCode.HenchmanCancellation))
-            action = RecoveryAction.RetryCurrentPhase;
         if (!autoKnown && leg == HandoffLeg.AutoRetainer)
             action = RecoveryAction.RetryCurrentPhase;
 
@@ -2462,12 +3111,16 @@ public sealed class HandoffController : IDisposable
             return message.Contains("timeout", StringComparison.OrdinalIgnoreCase)
                        ? RecoveryFailureCode.QuestionableStopTimeout
                        : RecoveryFailureCode.QuestionableStop;
+        if (Phase == HandoffPhase.WaitingForOceanDuty)
+            return RecoveryFailureCode.OceanDutyStartTimeout;
+        if (Phase == HandoffPhase.WaitingForOceanCleanup)
+            return RecoveryFailureCode.OceanCleanupStateInvalid;
+        if (Phase == HandoffPhase.WaitingForOriginal)
+            return RecoveryFailureCode.OriginalLoginTimeout;
+        if (Phase is HandoffPhase.ReturningOriginal or HandoffPhase.ResumingQuestionable or HandoffPhase.WaitingForQuestionableResume)
+            return RecoveryFailureCode.LifestreamReturn;
         if (message.Contains("Questionable", StringComparison.OrdinalIgnoreCase))
             return RecoveryFailureCode.QuestionableResume;
-        if (message.Contains("Henchman", StringComparison.OrdinalIgnoreCase))
-            return message.Contains("busy", StringComparison.OrdinalIgnoreCase)
-                ? RecoveryFailureCode.HenchmanConflict
-                : RecoveryFailureCode.HenchmanStateUnavailable;
         if (message.Contains("AutoRetainer", StringComparison.OrdinalIgnoreCase))
             return RecoveryFailureCode.AutoRetainerRunTimeout;
         if (message.Contains("Lifestream", StringComparison.OrdinalIgnoreCase) ||
@@ -2544,7 +3197,7 @@ public sealed class HandoffController : IDisposable
         lastLoggedMonitoringReason = reason;
         lastMonitoringLogUtc = now;
         log.Verbose(
-            "Monitoring state: {State}. Session={Session} HandoffPhase={HandoffPhase} PhaseElapsedSeconds={PhaseElapsedSeconds:0.0} SessionElapsedSeconds={SessionElapsedSeconds:0.0}. WaitReason={WaitReason} QuestionableIPC={QuestionableIPC} Questionable={Questionable} Quest={Quest} AutoRetainer={AutoRetainer} Busy={AutoRetainerBusy} MultiMode={MultiMode} Lifestream={Lifestream} ReadinessScan={ReadinessScan} Registered={Registered} Ready={Ready} ClosestRetainerSeconds={ClosestRetainerSeconds} LastReadinessScanUtc={LastReadinessScanUtc} LastDependencyCheckUtc={LastDependencyCheckUtc} TriggerReady={TriggerReady} PlayerLoggedIn={PlayerLoggedIn} ContentId={ContentId} Blockers={Blockers}",
+            "Monitoring state: {State}. Session={Session} HandoffPhase={HandoffPhase} PhaseElapsedSeconds={PhaseElapsedSeconds:0.0} SessionElapsedSeconds={SessionElapsedSeconds:0.0}. WaitReason={WaitReason} QuestionableIPC={QuestionableIPC} Questionable={Questionable} Quest={Quest} AutoRetainer={AutoRetainer} Busy={AutoRetainerBusy} MultiMode={MultiMode} Lifestream={Lifestream} ReadinessScan={ReadinessScan} Registered={Registered} Ready={Ready} ClosestRetainerSeconds={ClosestRetainerSeconds} LastReadinessScanUtc={LastReadinessScanUtc} LastDependencyCheckUtc={LastDependencyCheckUtc} TriggerReady={TriggerReady} PlayerLoggedIn={PlayerLoggedIn} ContentIdAvailable={ContentIdAvailable} CurrentContentId={CurrentContentId} FishingContentId={FishingContentId} OceanCleanupWait={OceanCleanupWait} OceanCleanupSource={OceanCleanupSource} OceanCleanupStableElapsedSeconds={OceanCleanupStableElapsedSeconds} OceanCleanupRequiredSeconds={OceanCleanupRequiredSeconds} WahToolsSnapshotUtc={WahToolsSnapshotUtc} WahToolsStatusEvaluationUtc={WahToolsStatusEvaluationUtc} WahToolsStatusAgeSeconds={WahToolsStatusAgeSeconds} Blockers={Blockers}",
             state,
             SessionId(),
             MonitoringStatusFormatter.FormatPhase(Phase),
@@ -2567,6 +3220,15 @@ public sealed class HandoffController : IDisposable
             monitoring.TriggerReadyCharacterCount?.ToString() ?? "none",
             monitoring.PlayerLoggedIn,
             monitoring.PlayerContentIdAvailable,
+            monitoring.CurrentContentId?.ToString() ?? "none",
+            monitoring.FishingCharacterContentId?.ToString() ?? "none",
+            monitoring.OceanCleanupWaitReason,
+            monitoring.OceanCleanupConfirmationSource,
+            monitoring.OceanCleanupStableElapsedSeconds?.ToString("0.0") ?? "none",
+            monitoring.OceanCleanupRequiredSeconds?.ToString("0.0") ?? "none",
+            monitoring.WahToolsStatus?.ObservedAtUtc.ToString("O") ?? "none",
+            monitoring.WahToolsStatusEvaluationUtc?.ToString("O") ?? "none",
+            monitoring.WahToolsStatusAgeSeconds?.ToString("0.000") ?? "none",
             monitoring.PlayerBlockers.Count == 0 ? "none" : string.Join(',', monitoring.PlayerBlockers));
     }
 
@@ -2602,10 +3264,17 @@ public sealed class HandoffController : IDisposable
 
     private void NormalizeSession(HandoffSession session)
     {
-        if (session.SessionVersion >= 5)
+        if (session.SessionVersion >= 8)
             return;
 
-        session.SessionVersion = 5;
+        if (session.SessionVersion < 6 && session.Kind == HandoffKind.OceanFishing)
+        {
+            session.WahToolsLaunchAmbiguous = true;
+            session.YesAlreadyLeaseRequired = false;
+            session.YesAlreadyLeaseAcquired = false;
+        }
+
+        session.SessionVersion = 8;
         if (session.CurrentLeg == HandoffLeg.None)
         {
             session.CurrentLeg = session.Kind == HandoffKind.OceanFishing || session.Phase is

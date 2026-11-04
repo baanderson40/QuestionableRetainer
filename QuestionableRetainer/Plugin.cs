@@ -54,7 +54,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windowSystem = new("QuestionableRetainer");
     private readonly Configuration configuration;
     private readonly AutoRetainerClient autoRetainer;
-    private readonly HenchmanClient henchman;
+    private readonly WahToolsFeeshClient wahToolsFeesh;
     private readonly YesAlreadyLease yesAlreadyLease;
     private readonly HandoffController controller;
     private readonly ConfigurationWindow configurationWindow;
@@ -63,22 +63,24 @@ public sealed class Plugin : IDalamudPlugin
     {
         ECommonsMain.Init(PluginInterface, this, Module.DalamudReflector);
         configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        if (configuration.Version < 3)
+        if (configuration.Version < 4)
         {
-            configuration.Version = 3;
+            configuration.Version = 4;
             SaveConfiguration();
         }
 
         configuration.OceanFishingLeadMinutes = Math.Clamp(configuration.OceanFishingLeadMinutes, 0, 30);
         autoRetainer = new AutoRetainerClient(PluginInterface, Log);
-        henchman = new HenchmanClient(PluginInterface, Log);
+        wahToolsFeesh = new WahToolsFeeshClient(PluginInterface, Log);
+        var wahToolsStatusReader = new WahToolsFeeshStatusReader(Log);
         yesAlreadyLease = new YesAlreadyLease(PluginInterface, Log);
         var questionable = new QuestionableClient(PluginInterface, Log);
         var lifestream = new LifestreamClient(PluginInterface, Log);
         controller = new HandoffController(
             configuration,
             autoRetainer,
-            henchman,
+            wahToolsFeesh,
+            wahToolsStatusReader,
             yesAlreadyLease,
             questionable,
             lifestream,
@@ -104,7 +106,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open settings, or use enable, disable, status, recover, resume, or discard.",
+            HelpMessage = "Open settings, or use enable, disable, status, recover, resume, discard, or reset.",
             ShowInHelp = true,
         });
         CommandManager.AddHandler(CommandAlias, new CommandInfo(OnCommand)
@@ -165,6 +167,9 @@ public sealed class Plugin : IDalamudPlugin
                 break;
             case "discard":
                 controller.CancelRecovery();
+                break;
+            case "reset":
+                controller.ResetPluginState();
                 break;
             default:
                 configurationWindow.Toggle();

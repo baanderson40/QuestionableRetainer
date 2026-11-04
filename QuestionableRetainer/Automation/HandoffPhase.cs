@@ -19,6 +19,10 @@ public enum HandoffPhase
     CheckingChainedWork,
     RecoveringHandoff,
     ManualIntervention,
+    PreparingFishingCharacter,
+    WaitingForFishingCharacter,
+    StartingWahToolsFishing,
+    WaitingForWahToolsStop,
 }
 
 public enum HandoffKind
@@ -76,6 +80,7 @@ public enum RecoveryFailureCode
     QuestionableResume,
     MissingSession,
     ContradictorySession,
+    OceanDutyExitedUnconfirmed,
 }
 
 public enum HenchmanOwnership
@@ -88,9 +93,15 @@ public enum HenchmanOwnership
     Stopped,
 }
 
+public enum OceanFishingCharacterMode
+{
+    CurrentCharacter,
+    SelectedCharacter,
+}
+
 public sealed class HandoffSession
 {
-    public int SessionVersion { get; set; } = 5;
+    public int SessionVersion { get; set; } = 8;
 
     public string CorrelationId { get; set; } = string.Empty;
 
@@ -191,6 +202,38 @@ public sealed class HandoffSession
     public bool AutoRetainerDispatchAmbiguous { get; set; }
 
     public HenchmanOwnership HenchmanOwnership { get; set; }
+
+    public ulong FishingContentId { get; set; }
+
+    public string FishingName { get; set; } = string.Empty;
+
+    public string FishingWorld { get; set; } = string.Empty;
+
+    public bool WahToolsLaunchRequested { get; set; }
+
+    public bool WahToolsLaunchAccepted { get; set; }
+
+    public bool WahToolsLaunchAmbiguous { get; set; }
+
+    public bool WahToolsStopRequested { get; set; }
+
+    public DateTime? WahToolsStopRequestedUtc { get; set; }
+
+    public DateTime? WahToolsStopAcceptedUtc { get; set; }
+
+    public long? WahToolsStopStatusGeneration { get; set; }
+
+    public bool OceanTerritoryEntered { get; set; }
+
+    public bool OceanTerritoryExited { get; set; }
+
+    public int FishingCharacterSwitchAttempts { get; set; }
+
+    public DateTime? NextFishingCharacterSwitchAttemptUtc { get; set; }
+
+    public int ReturnCharacterAttempts { get; set; }
+
+    public DateTime? NextReturnCharacterAttemptUtc { get; set; }
 }
 
 public enum RecoveryQuestDisposition

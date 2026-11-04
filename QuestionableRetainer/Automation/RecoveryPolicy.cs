@@ -42,16 +42,19 @@ public static class RecoveryPolicy
         if (context.Phase == HandoffPhase.WaitingForQuestionable && context.QuestionableFailure())
             return new(RecoveryAction.RetryCurrentPhase, "Questionable stop state is not yet observable.");
 
+        if (context.Phase is HandoffPhase.ReturningOriginal or
+            HandoffPhase.WaitingForOriginal or
+            HandoffPhase.ResumingQuestionable or
+            HandoffPhase.WaitingForQuestionableResume)
+            return new(RecoveryAction.ReturnOriginalAndResume, "Restoration failed; remaining on the original-character recovery path.");
+
         if (context.Leg == HandoffLeg.OceanFishing)
         {
             if (context.OceanDutyActive)
                 return new(RecoveryAction.WaitForActiveAutomation, "Ocean Fishing duty is active; waiting for a safe exit.");
 
-            if (!context.OceanDutyStarted && context.HenchmanOwnedThisRuntime && context.HenchmanBusy)
-                return new(RecoveryAction.CancelHenchmanThenRestore, "Cancelling QR-owned pre-duty Henchman work.");
-
             if (context.OceanDutyCompleted)
-                return new(RecoveryAction.SkipCurrentLeg, "Ocean Fishing duty completed; resolving cleanup without requiring Henchman activity.");
+                return new(RecoveryAction.SkipCurrentLeg, "Ocean Fishing duty completed; resolving cleanup from observed game state.");
 
             return new(RecoveryAction.SkipCurrentLeg, "Ocean Fishing leg cannot continue safely; skipping it.");
         }

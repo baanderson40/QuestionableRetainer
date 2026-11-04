@@ -39,9 +39,15 @@ public sealed class MonitoringStatus
 
     public bool LifestreamBusy { get; internal set; }
 
-    public bool? HenchmanAvailable { get; internal set; }
+    public bool? WahToolsAvailable { get; internal set; }
 
-    public bool HenchmanBusy { get; internal set; }
+    public bool WahToolsLaunchAccepted { get; internal set; }
+
+    public WahToolsFeeshStatus? WahToolsStatus { get; internal set; }
+
+    public DateTime? WahToolsStatusEvaluationUtc { get; internal set; }
+
+    public double? WahToolsStatusAgeSeconds { get; internal set; }
 
     public bool YesAlreadyLeaseAcquired { get; internal set; }
 
@@ -74,6 +80,18 @@ public sealed class MonitoringStatus
     public bool OceanDutyCompleted { get; internal set; }
 
     public DateTime? OceanCleanupStableSinceUtc { get; internal set; }
+
+    public double? OceanCleanupStableElapsedSeconds { get; internal set; }
+
+    public double? OceanCleanupRequiredSeconds { get; internal set; }
+
+    public OceanCleanupConfirmationSource OceanCleanupConfirmationSource { get; internal set; }
+
+    public string OceanCleanupWaitReason { get; internal set; } = string.Empty;
+
+    public ulong? CurrentContentId { get; internal set; }
+
+    public ulong? FishingCharacterContentId { get; internal set; }
 
     public int RegisteredCharacterCount { get; internal set; }
 
@@ -165,14 +183,16 @@ public static class MonitoringStatusFormatter
                $"AutoRetainer={FormatAvailability(status.AutoRetainerAvailable)}; " +
                $"Busy={status.AutoRetainerBusy}; MultiMode={status.AutoRetainerMultiModeActive}; " +
                $"Lifestream={FormatAvailability(status.LifestreamAvailable)}; " +
-               $"Henchman={FormatAvailability(status.HenchmanAvailable)}; HenchmanBusy={status.HenchmanBusy}; " +
+               $"WahTools={FormatAvailability(status.WahToolsAvailable)}; WahToolsLaunchAccepted={status.WahToolsLaunchAccepted}; " +
+               $"WahToolsGeneration={status.WahToolsStatus?.Generation.ToString() ?? "none"}; WahToolsTripState={status.WahToolsStatus?.TripState ?? "unknown"}; WahToolsTripStatus={status.WahToolsStatus?.TripStatus ?? "unknown"}; WahToolsCleaning={status.WahToolsStatus?.Cleaning?.ToString() ?? "unknown"}; WahToolsCleanerState={status.WahToolsStatus?.CleanerState ?? "unknown"}; WahToolsCleanerStatus={status.WahToolsStatus?.CleanerStatus ?? "unknown"}; WahToolsStatusObservedUtc={status.WahToolsStatus?.ObservedAtUtc.ToString("O") ?? "none"}; WahToolsStatusEvaluationUtc={status.WahToolsStatusEvaluationUtc?.ToString("O") ?? "none"}; WahToolsStatusAgeSeconds={status.WahToolsStatusAgeSeconds?.ToString("0.000") ?? "none"}; " +
                $"YesAlreadyLease={status.YesAlreadyLeaseAcquired}; " +
                $"RecoveryAction={status.RecoveryAction}; RecoveryFailure={status.RecoveryFailureCode?.ToString() ?? "none"}; RecoveryAttempt={status.RecoveryAttemptCount}; RecoveryNextAttempt={status.RecoveryNextAttemptUtc?.ToString("O") ?? "none"}; " +
                $"HandoffKind={(status.ActiveHandoffKind?.ToString() ?? "none")}; " +
                $"HandoffLeg={(status.CurrentHandoffLeg?.ToString() ?? "none")}; OceanLegResolved={status.OceanLegResolved}; AutoRetainerLegResolved={status.AutoRetainerLegResolved}; PendingAutoRetainerMode={(status.PendingAutoRetainerMode?.ToString() ?? "none")}; " +
                $"NextOcean={status.NextOceanWindowUtc?.ToString("O") ?? "none"}; OceanEligible={status.OceanLaunchEligible}; OceanHandled={status.OceanWindowHandled}; " +
                $"OceanDutyStarted={status.OceanDutyStarted}; OceanDutyCompleted={status.OceanDutyCompleted}; " +
-               $"OceanCleanupStableSince={status.OceanCleanupStableSinceUtc?.ToString("O") ?? "none"}; " +
+                $"OceanCleanupWait={status.OceanCleanupWaitReason}; OceanCleanupSource={status.OceanCleanupConfirmationSource}; OceanCleanupStableSince={status.OceanCleanupStableSinceUtc?.ToString("O") ?? "none"}; OceanCleanupStableElapsedSeconds={status.OceanCleanupStableElapsedSeconds?.ToString("0.0") ?? "none"}; OceanCleanupRequiredSeconds={status.OceanCleanupRequiredSeconds?.ToString("0.0") ?? "none"}; " +
+               $"CurrentContentId={status.CurrentContentId?.ToString() ?? "none"}; FishingContentId={status.FishingCharacterContentId?.ToString() ?? "none"}; " +
                $"ReadinessScan={FormatAvailability(status.ReadinessScanAvailable)}; " +
                $"Registered={status.RegisteredCharacterCount}; Ready={status.ReadyCharacterCount}; " +
                $"ClosestRetainer={closest}; LastReadinessScanUtc={lastReadinessScan}; " +
@@ -233,14 +253,18 @@ public static class MonitoringStatusFormatter
             HandoffPhase.WaitingForQuestionableResume => "Confirming Questionable resumed",
             HandoffPhase.AwaitingManualQuestionableResume => "Awaiting manual Questionable resume",
             HandoffPhase.WaitingForAutoRetainerIdle => "Preparing AutoRetainer",
-            HandoffPhase.WaitingForHenchmanStart => "Starting Henchman",
+            HandoffPhase.WaitingForHenchmanStart => "Legacy Henchman start recovery",
             HandoffPhase.WaitingForOceanDuty => "Waiting for Ocean Fishing voyage",
             HandoffPhase.WaitingForOceanCleanup => "Waiting for Ocean Fishing cleanup",
-            HandoffPhase.WaitingForHenchmanStop => "Stopping Henchman",
+            HandoffPhase.WaitingForHenchmanStop => "Legacy Henchman stop recovery",
             HandoffPhase.CheckingChainedWork => "Checking chained work",
             HandoffPhase.RecoveringHandoff => "Automatic recovery",
             HandoffPhase.Error => "Error",
             HandoffPhase.ManualIntervention => "Manual intervention required",
+            HandoffPhase.PreparingFishingCharacter => "Preparing fishing character",
+            HandoffPhase.WaitingForFishingCharacter => "Logging into fishing character",
+            HandoffPhase.StartingWahToolsFishing => "Starting WahTools voyage",
+            HandoffPhase.WaitingForWahToolsStop => "Stopping WahTools after voyage",
             _ => phase.ToString(),
         };
 
